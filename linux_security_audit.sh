@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Linux Security Audit Multitool v2.0
-#  Автор: github.com/ilyabem
+#  Автор: Security Audit Script
 #  Описание: Интерактивный аудит безопасности Linux-машин
 # =============================================================================
 
@@ -62,8 +62,8 @@ print_banner() {
     clear
     log ""
     log "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${RESET}"
-    log "${CYAN}${BOLD}║         🛡  Linux Security Audit Multitool v2.0  🛡               ║${RESET}"
-    log "${CYAN}${BOLD}║       github: github.com/ilyabem/security_audit_linux            ║${RESET}"
+    log "${CYAN}${BOLD}║         🛡  Linux Security Audit Multitool v2.0  🛡              ║${RESET}"
+    log "${CYAN}${BOLD}║              github: security-audit-tool                        ║${RESET}"
     log "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${RESET}"
     log ""
     log "  ${DIM}Хост:     ${WHITE}$(hostname -f 2>/dev/null || hostname)${RESET}"
@@ -1351,6 +1351,506 @@ offer_remediation() {
 
 MENU_CHOICE=""
 
+# 17. NTP — синхронизация времени
+check_ntp() {
+    section "NTP — СИНХРОНИЗАЦИЯ ВРЕМЕНИ"
+
+    local ntp_ok=0
+
+    # ── Определяем активный NTP-демон ────────────────────────────────────────
+    result_info "${BOLD}Статус NTP-сервиса:${RESET}"
+
+    # systemd-timesyncd
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        result_pass "systemd-timesyncd активен"
+        ntp_ok=1
+        local tsd_status
+        tsd_status=$(timedatectl show-timesync --value --property=ServerName 2>/dev/null || \
+                     timedatectl timesync-status 2>/dev/null | head -5)
+        [[ -n "$tsd_status" ]] && result_info "  Текущий сервер: ${tsd_status}"
+
+        # Проверяем /etc/systemd/timesyncd.conf
+        local tsd_conf="/etc/systemd/timesyncd.conf"
+        if [[ -f "$tsd_conf" ]]; then
+            local ntp_servers
+            ntp_servers=$(grep -E "^\s*NTP=" "$tsd_conf" 2>/dev/null | head -1)
+            local fallback
+            fallback=$(grep -E "^\s*FallbackNTP=" "$tsd_conf" 2>/dev/null | head -1)
+            if [[ -n "$ntp_servers" ]]; then
+                result_pass "NTP серверы заданы: ${ntp_servers}"
+            else
+                result_warn "NTP= не задан в timesyncd.conf — используются серверы дистрибутива"
+            fi
+            if [[ -n "$fallback" ]]; then
+                result_pass "Резервные NTP серверы: ${fallback}"
+            else
+                result_warn "FallbackNTP= не задан — нет резервных серверов"
+                add_fix "Добавить резервные NTP серверы в timesyncd.conf" \
+                    "grep -q '^FallbackNTP' /etc/systemd/timesyncd.conf && \
+                     sed -i 's/^FallbackNTP.*/FallbackNTP=0.pool.ntp.org 1.pool.ntp.org/' /etc/systemd/timesyncd.conf || \
+                     echo 'FallbackNTP=0.pool.ntp.org 1.pool.ntp.org' >> /etc/systemd/timesyncd.conf"
+            fi
+        fi
+
+    elif systemctl is-active --quiet chrony 2>/dev/null || \
+         systemctl is-active --quiet chronyd 2>/dev/null; then
+        result_pass "chrony активен"
+        ntp_ok=1
+        if command -v chronyc &>/dev/null; then
+            local tracking
+            tracking=$(chronyc tracking 2>/dev/null | grep -E "Reference ID|System time|Stratum")
+            while read -r line; do
+                result_info "  ${line}"
+            done <<< "$tracking"
+            # Источники
+            result_info "${BOLD}  Источники chrony:${RESET}"
+            chronyc sources 2>/dev/null | grep -E "^\^" | while read -r src; do
+                log "    ${DIM}${src}${RESET}"
+            done
+        fi
+
+    elif systemctl is-active --quiet ntp 2>/dev/null || \
+         systemctl is-active --quiet ntpd 2>/dev/null; then
+        result_pass "ntpd активен"
+        ntp_ok=1
+        if command -v ntpq &>/dev/null; then
+            result_info "${BOLD}  Пиры ntpq:${RESET}"
+            ntpq -p 2>/dev/null | while read -r line; do
+                log "    ${DIM}${line}${RESET}"
+            done
+        fi
+
+    else
+        result_fail "Ни один NTP-демон не запущен (timesyncd / chrony / ntpd)"
+        add_fix "Включить systemd-timesyncd (синхронизация времени)" \
+            "systemctl enable --now systemd-timesyncd"
+    fi
+
+    # ── Проверяем что NTP включён через timedatectl ──────────────────────────
+    echo ""
+    result_info "${BOLD}Синхронизация через timedatectl:${RESET}"
+    if command -v timedatectl &>/dev/null; then
+        local ntp_active
+        ntp_active=$(timedatectl show --value --property=NTP 2>/dev/null || \
+                     timedatectl status 2>/dev/null | grep "NTP" | awk '{print $NF}')
+        local synced
+        synced=$(timedatectl show --value --property=NTPSynchronized 2>/dev/null || \
+                 timedatectl status 2>/dev/null | grep "synchronized" | awk '{print $NF}')
+        local tz
+        tz=$(timedatectl show --value --property=Timezone 2>/dev/null || \
+             timedatectl status 2>/dev/null | grep "zone" | awk '{print $3}')
+
+        if [[ "${ntp_active,,}" == "yes" || "${ntp_active,,}" == "true" ]]; then
+            result_pass "NTP включён (timedatectl NTP=yes)"
+        else
+            result_fail "NTP отключён в timedatectl"
+            add_fix "Включить NTP синхронизацию" "timedatectl set-ntp true"
+        fi
+
+        if [[ "${synced,,}" == "yes" || "${synced,,}" == "true" ]]; then
+            result_pass "Время синхронизировано (NTPSynchronized=yes)"
+        else
+            result_warn "Время ещё не синхронизировано"
+        fi
+
+        [[ -n "$tz" ]] && result_info "  Часовой пояс: ${tz}"
+    else
+        result_warn "timedatectl недоступен"
+    fi
+
+    # ── Проверка точности времени (drift) ────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Смещение времени (drift):${RESET}"
+    if command -v chronyc &>/dev/null && ( systemctl is-active --quiet chrony 2>/dev/null || \
+       systemctl is-active --quiet chronyd 2>/dev/null ); then
+        local offset
+        offset=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[\d.]+(?= seconds)')
+        if [[ -n "$offset" ]]; then
+            # Сравниваем с порогом 1 секунда
+            local ok
+            ok=$(awk "BEGIN {print ($offset < 1.0) ? 1 : 0}")
+            if (( ok == 1 )); then
+                result_pass "Смещение времени: ${offset}s (< 1s — норма)"
+            else
+                result_warn "Смещение времени: ${offset}s (> 1s — возможны проблемы с Kerberos/TLS)"
+            fi
+        fi
+    elif command -v ntpq &>/dev/null && systemctl is-active --quiet ntpd 2>/dev/null; then
+        local offset
+        offset=$(ntpq -p 2>/dev/null | awk 'NR>2 && /^\*/{print $9}' | head -1)
+        [[ -n "$offset" ]] && result_info "  ntpq offset: ${offset}ms"
+    else
+        result_info "Проверка drift недоступна (требуется chronyc или ntpq)"
+    fi
+
+    # ── Stratum ───────────────────────────────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Stratum (уровень синхронизации):${RESET}"
+    if command -v chronyc &>/dev/null && ( systemctl is-active --quiet chrony 2>/dev/null || \
+       systemctl is-active --quiet chronyd 2>/dev/null ); then
+        local stratum
+        stratum=$(chronyc tracking 2>/dev/null | grep "Stratum" | awk '{print $3}')
+        if [[ -n "$stratum" ]]; then
+            if (( stratum <= 3 )); then
+                result_pass "Stratum: ${stratum} (хорошо — близко к атомным часам)"
+            elif (( stratum <= 5 )); then
+                result_warn "Stratum: ${stratum} (допустимо, но не идеально)"
+            else
+                result_fail "Stratum: ${stratum} (слишком далеко от источника точного времени)"
+            fi
+        fi
+    elif command -v timedatectl &>/dev/null; then
+        local stratum
+        stratum=$(timedatectl timesync-status 2>/dev/null | grep -i "Stratum" | awk '{print $2}')
+        if [[ -n "$stratum" ]]; then
+            if (( stratum <= 3 )); then
+                result_pass "Stratum: ${stratum}"
+            else
+                result_warn "Stratum: ${stratum} (рекомендуется ≤ 3)"
+            fi
+        fi
+    fi
+
+    # ── NTP порт открыт наружу? ───────────────────────────────────────────────
+    echo ""
+    result_info "${BOLD}NTP порт 123 (UDP):${RESET}"
+    if command -v ss &>/dev/null; then
+        local ntp_listen
+        ntp_listen=$(ss -ulnp 2>/dev/null | grep ":123 ")
+        if [[ -n "$ntp_listen" ]]; then
+            # Смотрим — слушает на 0.0.0.0 (опасно для публичных серверов) или только lo
+            if echo "$ntp_listen" | grep -qE "0\.0\.0\.0:123|:::123|\*:123"; then
+                result_warn "NTP порт 123 открыт на всех интерфейсах (сервер может быть использован для amplification-атак)"
+                add_fix "Ограничить NTP только localhost если сервер не является NTP-сервером" \
+                    "echo 'Настройте bindaddress в /etc/chrony.conf или /etc/ntp.conf'"
+            else
+                result_pass "NTP порт 123 слушает только на локальных интерфейсах"
+            fi
+        else
+            result_info "NTP порт 123 не слушает (клиентский режим — норма)"
+        fi
+    fi
+
+    # ── Конфигурация chrony — безопасность ───────────────────────────────────
+    echo ""
+    for chrony_conf in /etc/chrony.conf /etc/chrony/chrony.conf; do
+        [[ -f "$chrony_conf" ]] || continue
+        result_info "${BOLD}Безопасность chrony (${chrony_conf}):${RESET}"
+
+        # cmdallow — кто может управлять chronyc
+        if grep -qE "^\s*cmdallow" "$chrony_conf" 2>/dev/null; then
+            local cmdallow
+            cmdallow=$(grep -E "^\s*cmdallow" "$chrony_conf" | head -1)
+            if echo "$cmdallow" | grep -qE "cmdallow\s+all|0\.0\.0\.0"; then
+                result_fail "cmdallow all — управление chrony доступно отовсюду!"
+            else
+                result_pass "cmdallow ограничен: ${cmdallow}"
+            fi
+        fi
+
+        # makestep — коррекция большого drift
+        if grep -qE "^\s*makestep" "$chrony_conf" 2>/dev/null; then
+            result_pass "makestep настроен (корректировка больших смещений)"
+        else
+            result_warn "makestep не настроен в chrony.conf"
+        fi
+
+        # Количество серверов
+        local srv_count
+        srv_count=$(grep -cE "^\s*(server|pool|peer)" "$chrony_conf" 2>/dev/null || echo 0)
+        if (( srv_count >= 3 )); then
+            result_pass "Источников NTP: ${srv_count} (≥ 3 — хорошо для отказоустойчивости)"
+        elif (( srv_count >= 1 )); then
+            result_warn "Источников NTP: ${srv_count} (рекомендуется ≥ 3)"
+        else
+            result_fail "Источники NTP не настроены в ${chrony_conf}"
+        fi
+    done
+}
+
+# 18. DNS — конфигурация и безопасность
+check_dns() {
+    section "DNS — КОНФИГУРАЦИЯ И БЕЗОПАСНОСТЬ"
+
+    # ── Текущие DNS-серверы ───────────────────────────────────────────────────
+    result_info "${BOLD}Настроенные DNS-серверы:${RESET}"
+
+    local dns_servers=()
+
+    # systemd-resolved
+    if command -v resolvectl &>/dev/null 2>/dev/null; then
+        result_info "  ${DIM}(через systemd-resolved / resolvectl)${RESET}"
+        local res_dns
+        res_dns=$(resolvectl status 2>/dev/null | grep "DNS Servers" | sed 's/.*DNS Servers: //' | head -3)
+        while read -r srv; do
+            [[ -z "$srv" ]] && continue
+            for ip in $srv; do
+                dns_servers+=("$ip")
+                result_info "  DNS: ${WHITE}${ip}${RESET}"
+            done
+        done <<< "$res_dns"
+    fi
+
+    # /etc/resolv.conf
+    if [[ -f /etc/resolv.conf ]]; then
+        result_info "  ${DIM}(/etc/resolv.conf)${RESET}"
+        while read -r line; do
+            if [[ "$line" =~ ^nameserver ]]; then
+                local ip="${line#nameserver }"
+                ip="${ip// /}"
+                dns_servers+=("$ip")
+                result_info "  nameserver: ${WHITE}${ip}${RESET}"
+            fi
+        done < /etc/resolv.conf
+    fi
+
+    if [[ ${#dns_servers[@]} -eq 0 ]]; then
+        result_fail "DNS-серверы не обнаружены"
+    fi
+
+    # ── Классификация DNS-серверов ────────────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Анализ DNS-серверов:${RESET}"
+
+    # Известные публичные DNS
+    declare -A known_dns=(
+        ["8.8.8.8"]="Google DNS"          ["8.8.4.4"]="Google DNS"
+        ["1.1.1.1"]="Cloudflare DNS"      ["1.0.0.1"]="Cloudflare DNS"
+        ["9.9.9.9"]="Quad9 (фильтрация)" ["149.112.112.112"]="Quad9"
+        ["208.67.222.222"]="OpenDNS"      ["208.67.220.220"]="OpenDNS"
+        ["77.88.8.8"]="Yandex DNS"        ["77.88.8.1"]="Yandex DNS"
+        ["94.140.14.14"]="AdGuard DNS"    ["94.140.15.15"]="AdGuard DNS"
+        ["176.103.130.130"]="AdGuard DNS" ["185.228.168.9"]="CleanBrowsing"
+        ["127.0.0.1"]="localhost"         ["127.0.0.53"]="systemd-resolved (stub)"
+        ["::1"]="localhost IPv6"
+    )
+
+    local has_public=0
+    local has_internal=0
+    local seen_servers=()
+
+    for ip in "${dns_servers[@]}"; do
+        # Дедупликация
+        local dup=0
+        for s in "${seen_servers[@]:-}"; do [[ "$s" == "$ip" ]] && dup=1 && break; done
+        (( dup == 1 )) && continue
+        seen_servers+=("$ip")
+
+        local label="${known_dns[$ip]:-}"
+        if [[ -n "$label" ]]; then
+            if [[ "$label" == "localhost"* || "$label" == "systemd-resolved"* ]]; then
+                result_pass "  ${ip} — ${label}"
+            else
+                result_warn "  ${ip} — ${label} ${DIM}(публичный DNS — трафик уходит наружу)${RESET}"
+                has_public=1
+            fi
+        elif [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+            result_pass "  ${ip} — внутренний DNS-сервер ${DIM}(приватная сеть)${RESET}"
+            has_internal=1
+        elif [[ "$ip" =~ ^(127\.|::1$|fe80:) ]]; then
+            result_pass "  ${ip} — локальный резолвер"
+        else
+            result_warn "  ${ip} — неизвестный DNS-сервер"
+        fi
+    done
+
+    (( has_public == 1 )) && result_warn "Используется публичный DNS — все DNS-запросы видны провайдеру сервиса"
+
+    # ── /etc/resolv.conf — безопасность ──────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Безопасность /etc/resolv.conf:${RESET}"
+    if [[ -f /etc/resolv.conf ]]; then
+        local resolv_perm
+        resolv_perm=$(stat -c "%a %U %G" /etc/resolv.conf 2>/dev/null)
+        local resolv_mode
+        resolv_mode=$(stat -c "%a" /etc/resolv.conf 2>/dev/null)
+
+        result_info "  Права: ${resolv_perm}"
+        if [[ "$resolv_mode" =~ ^[64][04][04]$ ]]; then
+            result_pass "  Права /etc/resolv.conf в норме (${resolv_mode})"
+        else
+            result_warn "  Нестандартные права /etc/resolv.conf: ${resolv_mode}"
+        fi
+
+        # Проверяем что файл не world-writable
+        local o_write
+        o_write=$(stat -c "%A" /etc/resolv.conf 2>/dev/null | cut -c9)
+        if [[ "$o_write" == "w" ]]; then
+            result_fail "/etc/resolv.conf доступен для записи всем пользователям!"
+            add_fix "Убрать world-write с /etc/resolv.conf" \
+                "chmod o-w /etc/resolv.conf"
+        fi
+
+        # Симлинк?
+        if [[ -L /etc/resolv.conf ]]; then
+            local target
+            target=$(readlink -f /etc/resolv.conf 2>/dev/null)
+            result_info "  /etc/resolv.conf — симлинк → ${target}"
+            if echo "$target" | grep -q "systemd\|resolvectl\|resolved"; then
+                result_pass "  Управляется systemd-resolved (норма)"
+            elif echo "$target" | grep -q "NetworkManager"; then
+                result_pass "  Управляется NetworkManager (норма)"
+            else
+                result_warn "  Нестандартный симлинк: → ${target}"
+            fi
+        fi
+
+        # Опции безопасности
+        result_info "${BOLD}  Опции resolv.conf:${RESET}"
+        local options_line
+        options_line=$(grep -E "^\s*options" /etc/resolv.conf 2>/dev/null | head -1)
+        if [[ -n "$options_line" ]]; then
+            result_info "  ${options_line}"
+            # ndots — влияет на безопасность (SSRF через DNS)
+            if echo "$options_line" | grep -oP "ndots:\K[0-9]+" | grep -qE "^[6-9]$|^[0-9]{2,}"; then
+                result_warn "  ndots слишком высокий — возможны утечки внутренних имён во внешний DNS"
+            fi
+        fi
+
+        # search / domain — утечка внутренних доменов
+        local search_line
+        search_line=$(grep -E "^\s*(search|domain)" /etc/resolv.conf 2>/dev/null)
+        if [[ -n "$search_line" ]]; then
+            result_info "  Домены поиска: ${search_line}"
+        fi
+    fi
+
+    # ── systemd-resolved — конфигурация ──────────────────────────────────────
+    echo ""
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        result_info "${BOLD}systemd-resolved:${RESET}"
+        result_pass "systemd-resolved активен"
+
+        local resolved_conf="/etc/systemd/resolved.conf"
+        if [[ -f "$resolved_conf" ]]; then
+            # DNSSEC
+            local dnssec
+            dnssec=$(grep -E "^\s*DNSSEC=" "$resolved_conf" 2>/dev/null | awk -F= '{print $2}' | tr -d ' ')
+            if [[ -z "$dnssec" ]]; then
+                dnssec=$(resolvectl status 2>/dev/null | grep -i "DNSSEC" | awk '{print $NF}' | head -1)
+            fi
+            if [[ "${dnssec,,}" == "yes" || "${dnssec,,}" == "true" || "${dnssec,,}" == "allow-downgrade" ]]; then
+                result_pass "DNSSEC: ${dnssec} (проверка подписи DNS включена)"
+            elif [[ "${dnssec,,}" == "no" || -z "$dnssec" ]]; then
+                result_warn "DNSSEC отключён — DNS-ответы не проверяются на подлинность"
+                add_fix "Включить DNSSEC в systemd-resolved" \
+                    "grep -q '^DNSSEC' /etc/systemd/resolved.conf && \
+                     sed -i 's/^DNSSEC.*/DNSSEC=allow-downgrade/' /etc/systemd/resolved.conf || \
+                     echo 'DNSSEC=allow-downgrade' >> /etc/systemd/resolved.conf; \
+                     systemctl restart systemd-resolved"
+            fi
+
+            # DNSOverTLS
+            local dot
+            dot=$(grep -E "^\s*DNSOverTLS=" "$resolved_conf" 2>/dev/null | awk -F= '{print $2}' | tr -d ' ')
+            if [[ "${dot,,}" == "yes" || "${dot,,}" == "opportunistic" ]]; then
+                result_pass "DNS-over-TLS: ${dot} (шифрование DNS запросов)"
+            else
+                result_warn "DNS-over-TLS не включён — DNS запросы передаются в открытом виде"
+                add_fix "Включить DNS-over-TLS в systemd-resolved" \
+                    "grep -q '^DNSOverTLS' /etc/systemd/resolved.conf && \
+                     sed -i 's/^DNSOverTLS.*/DNSOverTLS=opportunistic/' /etc/systemd/resolved.conf || \
+                     echo 'DNSOverTLS=opportunistic' >> /etc/systemd/resolved.conf; \
+                     systemctl restart systemd-resolved"
+            fi
+
+            # Cache
+            local cache
+            cache=$(grep -E "^\s*Cache=" "$resolved_conf" 2>/dev/null | awk -F= '{print $2}' | tr -d ' ')
+            if [[ "${cache,,}" == "no" ]]; then
+                result_warn "DNS кеш отключён — снижает производительность"
+            elif [[ "${cache,,}" == "no-negative" ]]; then
+                result_warn "DNS кеш не кеширует отрицательные ответы (no-negative)"
+            else
+                result_pass "DNS кеш: ${cache:-yes (по умолчанию)}"
+            fi
+        fi
+    fi
+
+    # ── Проверка DNS-резолвинга ───────────────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Проверка DNS-резолвинга:${RESET}"
+    local test_domains=("google.com" "cloudflare.com" "example.com")
+    local dns_working=0
+    for domain in "${test_domains[@]}"; do
+        if command -v dig &>/dev/null; then
+            local ans
+            ans=$(dig +short +timeout=3 +tries=1 "$domain" A 2>/dev/null | head -1)
+            if [[ -n "$ans" ]]; then
+                result_pass "  Резолвинг ${domain} → ${ans}"
+                dns_working=1
+                break
+            fi
+        elif command -v nslookup &>/dev/null; then
+            if nslookup "$domain" &>/dev/null 2>&1; then
+                result_pass "  Резолвинг ${domain} работает (nslookup)"
+                dns_working=1
+                break
+            fi
+        elif command -v getent &>/dev/null; then
+            if getent hosts "$domain" &>/dev/null 2>&1; then
+                result_pass "  Резолвинг ${domain} работает (getent)"
+                dns_working=1
+                break
+            fi
+        fi
+    done
+    (( dns_working == 0 )) && result_fail "DNS-резолвинг не работает или инструменты недоступны"
+
+    # ── Проверка на DNS-спуфинг в /etc/hosts ─────────────────────────────────
+    echo ""
+    result_info "${BOLD}Подмена популярных доменов в /etc/hosts:${RESET}"
+    local spoof_domains=("google.com" "github.com" "pypi.org" "npmjs.com"
+                         "apt.releases.hashicorp.com" "registry.npmjs.org"
+                         "registry-1.docker.io" "auth.docker.io"
+                         "update.microsoft.com" "windowsupdate.com")
+    local spoof_found=0
+    for d in "${spoof_domains[@]}"; do
+        if grep -qE "^\s*[0-9a-f:]+\s+.*${d}" /etc/hosts 2>/dev/null; then
+            local spoof_line
+            spoof_line=$(grep -E "^\s*[0-9a-f:]+\s+.*${d}" /etc/hosts | head -1)
+            result_fail "Возможный DNS-спуфинг в /etc/hosts: ${spoof_line}"
+            spoof_found=$((spoof_found+1))
+        fi
+    done
+    (( spoof_found == 0 )) && result_pass "Подмены популярных доменов в /etc/hosts не обнаружено"
+
+    # ── DNSSEC — прямая проверка резолвера ───────────────────────────────────
+    echo ""
+    result_info "${BOLD}DNSSEC — проверка резолвера:${RESET}"
+    if command -v dig &>/dev/null; then
+        # Проверяем что резолвер проверяет DNSSEC (dnssec-failed.org должен НЕ резолвиться)
+        local dnssec_fail
+        dnssec_fail=$(dig +short +timeout=3 +tries=1 dnssec-failed.org A 2>/dev/null)
+        if [[ -z "$dnssec_fail" ]]; then
+            result_pass "DNSSEC работает: dnssec-failed.org не резолвится (валидация активна)"
+        else
+            result_warn "DNSSEC не валидирует: dnssec-failed.org резолвится (${dnssec_fail})"
+        fi
+
+        # Проверяем что корректный DNSSEC-домен резолвится
+        local dnssec_ok
+        dnssec_ok=$(dig +short +timeout=3 +tries=1 dnssec-tools.org A 2>/dev/null | head -1)
+        if [[ -n "$dnssec_ok" ]]; then
+            result_pass "DNSSEC-домен dnssec-tools.org резолвится корректно"
+        fi
+    else
+        result_info "dig не установлен — пропуск DNSSEC-проверки"
+    fi
+
+    # ── Утечки DNS через stub-resolver ───────────────────────────────────────
+    echo ""
+    result_info "${BOLD}Stub-резолвер:${RESET}"
+    if grep -q "127.0.0.53" /etc/resolv.conf 2>/dev/null; then
+        result_pass "Используется systemd-resolved stub (127.0.0.53) — централизованный резолвинг"
+    elif grep -q "127.0.0.1" /etc/resolv.conf 2>/dev/null && \
+         ( systemctl is-active --quiet dnsmasq 2>/dev/null || \
+           systemctl is-active --quiet unbound 2>/dev/null ); then
+        result_pass "Локальный DNS-резолвер на 127.0.0.1 (dnsmasq/unbound)"
+    fi
+}
+
+
 # ─────────────────────────── ПОИСК БЭКДОРОВ ──────────────────────────────────
 
 check_backdoors() {
@@ -1470,7 +1970,7 @@ check_backdoors() {
         [[ -f "$akfile" ]] || continue
         local key_count
         key_count=$(grep -cv "^#\|^$" "$akfile" 2>/dev/null || echo 0)
-        result_info "  ${uname}: ${akfile} — ${key_count} ключ(ей)"
+        result_info "  ${uname}: ${akfile} — ${key_count} ключей"
         # Команды в ключах (command= опция) — потенциальный бэкдор
         if grep -qE "^command=" "$akfile" 2>/dev/null; then
             result_warn "  В authorized_keys найдена опция command= (принудительная команда при входе)"
@@ -1723,6 +2223,8 @@ show_menu() {
     echo -e "  ${WHITE}${BOLD}5)${RESET} Сеть и брандмауэр" >/dev/tty
     echo -e "  ${WHITE}${BOLD}6)${RESET} Ядро, файловая система, шифрование" >/dev/tty
     echo -e "  ${WHITE}${BOLD}7)${RESET} Логирование, SELinux/AppArmor" >/dev/tty
+    echo -e "  ${WHITE}${BOLD}9)${RESET}  NTP — синхронизация времени" >/dev/tty
+    echo -e "  ${WHITE}${BOLD}10)${RESET} DNS — конфигурация и безопасность" >/dev/tty
     echo -e "  ${RED}${BOLD}8)${RESET}${RED} Поиск бэкдоров и закладок ${DIM}(отдельный модуль)${RESET}" >/dev/tty
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────${RESET}" >/dev/tty
     echo -e "  ${CYAN}${BOLD}s)${RESET} Настройки параметров аудита" >/dev/tty
@@ -1733,8 +2235,8 @@ show_menu() {
         read -r MENU_CHOICE </dev/tty
         MENU_CHOICE="${MENU_CHOICE//[[:space:]]/}"
         case "$MENU_CHOICE" in
-            1|2|3|4|5|6|7|8|s|S|q|Q) break ;;
-            *) echo -e "${RED}  Введите цифру 1–8, s или q${RESET}" >/dev/tty ;;
+            1|2|3|4|5|6|7|8|9|10|s|S|q|Q) break ;;
+            *) echo -e "${RED}  Введите цифру 1–10, s или q${RESET}" >/dev/tty ;;
         esac
     done
 }
@@ -1754,6 +2256,7 @@ run_checks() {
             check_filesystem; check_kernel
             check_logging; check_mac; check_encryption
             check_cron; check_network
+            check_ntp; check_dns
             ;;
         2) check_password_policy; check_pam_pwquality ;;
         3) check_ssh; check_ssh_crypto ;;
@@ -1762,6 +2265,8 @@ run_checks() {
         6) check_kernel; check_filesystem; check_encryption ;;
         7) check_logging; check_mac ;;
         8) check_backdoors ;;
+        9) check_ntp ;;
+        10) check_dns ;;
     esac
 }
 
@@ -1780,6 +2285,8 @@ main() {
             --kernel)         oneshot_mode="6"; skip_interactive=1 ;;
             --logging)        oneshot_mode="7"; skip_interactive=1 ;;
             --backdoors)      oneshot_mode="8"; skip_interactive=1 ;;
+            --ntp)            oneshot_mode="9"; skip_interactive=1 ;;
+            --dns)            oneshot_mode="10"; skip_interactive=1 ;;
             --no-interactive) skip_interactive=1 ;;
             --help|-h)
                 echo "Использование: $0 [ОПЦИЯ]"
@@ -1790,6 +2297,8 @@ main() {
                 echo "  --kernel         Ядро и ФС"
                 echo "  --logging        Логирование"
                 echo "  --backdoors      Поиск бэкдоров"
+                echo "  --ntp            Проверка NTP"
+                echo "  --dns            Проверка DNS"
                 echo "  --no-interactive Без интерактива"
                 echo "  --help           Справка"
                 exit 0
