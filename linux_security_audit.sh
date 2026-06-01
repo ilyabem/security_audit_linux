@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Linux Security Audit Multitool v2.0
-#  Автор: Security Audit Script
+#  Автор: ilyabem
 #  Описание: Интерактивный аудит безопасности Linux-машин
 # =============================================================================
 
@@ -63,7 +63,7 @@ print_banner() {
     log ""
     log "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${RESET}"
     log "${CYAN}${BOLD}║         🛡  Linux Security Audit Multitool v2.0  🛡              ║${RESET}"
-    log "${CYAN}${BOLD}║              github: security-audit-tool                        ║${RESET}"
+    log "${CYAN}${BOLD}║            github: ilyabem/security_audit_linux                  ║${RESET}"
     log "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${RESET}"
     log ""
     log "  ${DIM}Хост:     ${WHITE}$(hostname -f 2>/dev/null || hostname)${RESET}"
