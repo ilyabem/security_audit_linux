@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Linux Security Audit Multitool v2.0
+#  Linux Security Audit Multitool v2.1
 #  Автор: ilyabem
 #  Описание: Интерактивный аудит безопасности Linux-машин
 # =============================================================================
@@ -26,12 +26,20 @@ INFO="${CYAN}[ℹ INFO]${RESET}"
 SECTION="${BLUE}${BOLD}"
 
 # ─────────────────────────── Глобальные переменные ──────────────────────────
-REPORT_FILE="/tmp/security_audit_$(hostname)_$(date +%Y%m%d_%H%M%S).txt"
+REPORT_FILE="/tmp/security_audit_$(hostname -s 2>/dev/null || echo host)_$(date +%Y%m%d_%H%M%S).txt"
 ISSUES=0
-NOPASS_USERS=()
-REMEDIATION_ACTIONS=()
 WARNINGS=0
 PASSES=0
+NOPASS_USERS=()
+
+# Отчёт может содержать имена пользователей, открытые порты и пути — создаём
+# его сразу с правами 600, чтобы он не читался всей системой из /tmp.
+if : > "$REPORT_FILE" 2>/dev/null; then
+    chmod 600 "$REPORT_FILE" 2>/dev/null || true
+else
+    REPORT_FILE="$(mktemp -t security_audit.XXXXXX)" || REPORT_FILE=/dev/null
+    [[ "$REPORT_FILE" != /dev/null ]] && chmod 600 "$REPORT_FILE" 2>/dev/null
+fi
 
 # Пороговые значения по умолчанию (будут переопределены при интерактивной настройке)
 MIN_PASS_LEN=12
@@ -46,23 +54,34 @@ REQUIRE_SPECIAL=1
 SSH_IDLE_TIMEOUT=300
 SHELL_TIMEOUT=600
 MAX_AUTH_TRIES=3
-LOGIN_RETRIES=3
+
+# ── Параметры, нужные безопасному движку применения (перенесены из pass_polic.sh) ──
+FAIL_DENY=5                 # неудачных попыток до блокировки (pam_faillock)
+FAIL_UNLOCK_MINUTES=15      # время блокировки, минут
+UID_MIN=1000                # мин. UID, к которому применяется старение паролей
+CONFIRM_TIMEOUT=180         # сек. на подтверждение до авто-отката safe-apply
+DO_ROLLBACK_GUARD=1         # 1 — включён предохранитель (авто-откат по таймауту)
 
 # ─────────────────────────── Вспомогательные функции ────────────────────────
 
+# ANSI-последовательности нужны только терминалу; в файл отчёта пишем чистый
+# текст, иначе отчёт нечитаем в любом редакторе/грепе.
+strip_ansi() { sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g'; }
+
 log() {
-    echo -e "$*" | tee -a "$REPORT_FILE"
+    echo -e "$*"
+    echo -e "$*" | strip_ansi >> "$REPORT_FILE"
 }
 
 log_only() {
-    echo -e "$*" >> "$REPORT_FILE"
+    echo -e "$*" | strip_ansi >> "$REPORT_FILE"
 }
 
 print_banner() {
     clear
     log ""
     log "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${RESET}"
-    log "${CYAN}${BOLD}║         🛡  Linux Security Audit Multitool v2.0  🛡              ║${RESET}"
+    log "${CYAN}${BOLD}║         🛡  Linux Security Audit Multitool v2.1  🛡              ║${RESET}"
     log "${CYAN}${BOLD}║            github: ilyabem/security_audit_linux                  ║${RESET}"
     log "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${RESET}"
     log ""
@@ -82,10 +101,13 @@ section() {
     log "${SECTION}══════════════════════════════════════════════════════════════════${RESET}"
 }
 
-result_pass() { log "  ${PASS} $*"; PASSES=$((PASSES+1)); }
-result_fail() { log "  ${FAIL} $*"; ISSUES=$((ISSUES+1)); }
-result_warn() { log "  ${WARN} $*"; WARNINGS=$((WARNINGS+1)); }
-result_info() { log "  ${INFO} $*"; }
+result_pass() { log "  ${PASS} $*"; PASSES=$((PASSES+1)); return 0; }
+result_fail() { log "  ${FAIL} $*"; ISSUES=$((ISSUES+1)); return 0; }
+result_warn() { log "  ${WARN} $*"; WARNINGS=$((WARNINGS+1)); return 0; }
+result_info() { log "  ${INFO} $*"; return 0; }
+
+# Значения из конфигов могут оказаться мусором — перед (( )) всегда проверяем.
+is_num() { [[ "${1:-}" =~ ^-?[0-9]+$ ]]; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -118,6 +140,11 @@ read_int() {
     local min="${3:-0}"
     local max="${4:-99999}"
     local val
+    # Дефолт подставляется из системы и может выйти за диапазон — тогда Enter
+    # никогда не проходил валидацию и пользователь застревал в цикле.
+    is_num "$default" || default="$min"
+    (( default < min )) && default="$min"
+    (( default > max )) && default="$max"
     while true; do
         printf "%b" "${CYAN}${prompt} [по умолчанию: ${default}]: ${RESET}" >/dev/tty
         read -r val </dev/tty
@@ -130,15 +157,47 @@ read_int() {
     done
 }
 
+# Читает "key = value" / "key value" из конфиг-файла (pwquality.conf, faillock.conf,
+# login.defs и т.п.). Возвращает пусто, если ключ не найден — тогда вызывающий код
+# оставляет жёстко заданный дефолт. Заимствовано из pass_polic.sh: показывать
+# ТЕКУЩЕЕ значение системы как дефолт в интерактивной настройке, а не голую константу.
+sys_kv() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    grep -E "^[[:space:]]*${key}[[:space:]]*[=]?[[:space:]]*[0-9]+" "$file" 2>/dev/null \
+        | tail -1 | grep -oE '[0-9]+' | tail -1
+}
+
+# Подставляет текущие системные значения вместо статичных дефолтов, если их
+# удалось прочитать (только для password/PAM-параметров — остального они не касаются).
+seed_defaults_from_system() {
+    local v
+    v="$(sys_kv /etc/security/pwquality.conf minlen)"; [[ -n "$v" ]] && MIN_PASS_LEN="$v"
+    v="$(sys_kv /etc/login.defs PASS_MAX_DAYS)"; [[ -n "$v" ]] && PASS_MAX_AGE="$v"
+    v="$(sys_kv /etc/login.defs PASS_MIN_DAYS)"; [[ -n "$v" ]] && PASS_MIN_AGE="$v"
+    v="$(sys_kv /etc/login.defs PASS_WARN_AGE)"; [[ -n "$v" ]] && PASS_WARN_AGE="$v"
+    v="$(sys_kv /etc/security/pwhistory.conf remember)"; [[ -n "$v" ]] && PASS_HISTORY="$v"
+    [[ -z "$v" ]] && { v="$(grep -oE 'remember=[0-9]+' /etc/pam.d/common-password 2>/dev/null | tail -1 | grep -oE '[0-9]+')"; [[ -n "$v" ]] && PASS_HISTORY="$v"; }
+    v="$(sys_kv /etc/security/faillock.conf deny)"; [[ -n "$v" ]] && FAIL_DENY="$v"
+    v="$(sys_kv /etc/security/faillock.conf unlock_time)"
+    if [[ -n "$v" ]]; then
+        FAIL_UNLOCK_MINUTES=$(( v / 60 ))
+        (( FAIL_UNLOCK_MINUTES < 1 )) && FAIL_UNLOCK_MINUTES=1
+    fi
+    v="$(sys_kv /etc/login.defs UID_MIN)"; [[ -n "$v" ]] && UID_MIN="$v"
+}
+
 # ─────────────────────────── Интерактивная настройка ────────────────────────
 
 interactive_setup() {
+    seed_defaults_from_system
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}${MAGENTA}║   Интерактивная настройка параметров     ║${RESET}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════╝${RESET}"
     echo ""
-    echo -e "${DIM}Настройте пороговые значения для аудита. Enter = значение по умолчанию.${RESET}"
+    echo -e "${DIM}Настройте пороговые значения для аудита. Enter = значение по умолчанию${RESET}"
+    echo -e "${DIM}(там, где это возможно, дефолт подставлен из ТЕКУЩИХ настроек системы).${RESET}"
     echo ""
 
     echo -e "${WHITE}${BOLD}── Парольная политика ──────────────────────────${RESET}"
@@ -149,10 +208,20 @@ interactive_setup() {
     read_int "Количество запоминаемых паролей (история)" "$PASS_HISTORY" 0 24; PASS_HISTORY="$INT_RESULT"
 
     echo ""
+    echo -e "${WHITE}${BOLD}── Блокировка после неудачных попыток (pam_faillock) ──${RESET}"
+    read_int "Неудачных попыток до блокировки" "$FAIL_DENY" 1 20; FAIL_DENY="$INT_RESULT"
+    read_int "Время блокировки (минуты)" "$FAIL_UNLOCK_MINUTES" 1 1440; FAIL_UNLOCK_MINUTES="$INT_RESULT"
+    read_int "Минимальный UID, к которому применяется старение паролей" "$UID_MIN" 100 60000; UID_MIN="$INT_RESULT"
+
+    echo ""
     echo -e "${WHITE}${BOLD}── Сложность пароля ────────────────────────────${RESET}"
+    # shellcheck disable=SC2034  # REQUIRE_* читаются косвенно (${!reqvar}) в check_pam_pwquality
     if confirm "Требовать ЗАГЛАВНЫЕ буквы"; then REQUIRE_UPPERCASE=1; else REQUIRE_UPPERCASE=0; fi
+    # shellcheck disable=SC2034
     if confirm "Требовать строчные буквы"; then REQUIRE_LOWERCASE=1; else REQUIRE_LOWERCASE=0; fi
+    # shellcheck disable=SC2034
     if confirm "Требовать цифры"; then REQUIRE_DIGITS=1; else REQUIRE_DIGITS=0; fi
+    # shellcheck disable=SC2034
     if confirm "Требовать спецсимволы"; then REQUIRE_SPECIAL=1; else REQUIRE_SPECIAL=0; fi
 
     echo ""
@@ -165,8 +234,42 @@ interactive_setup() {
     read_int "Максимум попыток аутентификации SSH" "$MAX_AUTH_TRIES" 1 10; MAX_AUTH_TRIES="$INT_RESULT"
 
     echo ""
+    echo -e "${WHITE}${BOLD}── Безопасное применение исправлений ───────────${RESET}"
+    echo -e "${DIM}Для password/PAM, SSH и firewall исправления применяются с бэкапом${RESET}"
+    echo -e "${DIM}и окном на подтверждение — иначе автооткат по таймауту.${RESET}"
+    read_int "Таймаут окна подтверждения (секунды)" "$CONFIRM_TIMEOUT" 30 900; CONFIRM_TIMEOUT="$INT_RESULT"
+    if confirm "Включить предохранитель (авто-откат по таймауту)" y; then DO_ROLLBACK_GUARD=1; else DO_ROLLBACK_GUARD=0; fi
+
+    echo ""
     echo -e "${GREEN}${BOLD}✔ Параметры сохранены. Начинаю аудит...${RESET}"
     sleep 1
+}
+
+
+# Полный обход ФС в поисках SUID/SGID делается и в check_filesystem,
+# и в check_backdoors — кэшируем, чтобы не сканировать диск дважды.
+SUID_CACHE=""
+SUID_CACHE_DONE=0
+collect_suid() {
+    (( SUID_CACHE_DONE == 1 )) && return 0
+    SUID_CACHE="$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null)"
+    SUID_CACHE_DONE=1
+    return 0
+}
+
+# Персистентная запись sysctl-параметра в /etc/sysctl.d/, с нейтрализацией
+# конфликтующих строк в /etc/sysctl.conf.
+sysctl_persist() {
+    local key="$1" val="$2" file="/etc/sysctl.d/99-security-audit.conf" esc
+    esc="${key//./\\.}"
+    mkdir -p /etc/sysctl.d || return 1
+    [[ -f "$file" ]] || printf '# Создан security_audit.sh\n' > "$file"
+    sed -i -E "/^[[:space:]]*#?[[:space:]]*${esc}[[:space:]]*=/d" "$file"
+    printf '%s = %s\n' "$key" "$val" >> "$file"
+    if [[ -f /etc/sysctl.conf ]]; then
+        sed -i -E "s|^([[:space:]]*${esc}[[:space:]]*=.*)$|# disabled by security_audit: \\1|" /etc/sysctl.conf
+    fi
+    return 0
 }
 
 # ─────────────────────────── ПРОВЕРКИ ───────────────────────────────────────
@@ -187,11 +290,14 @@ check_password_policy() {
     max_days=$(grep -E "^PASS_MAX_DAYS" "$file" 2>/dev/null | awk '{print $2}' || echo "")
     if [[ -z "$max_days" ]]; then
         result_fail "PASS_MAX_DAYS не задан"
+        add_fix "Установить PASS_MAX_DAYS=${PASS_MAX_AGE} в /etc/login.defs" "password"
+    elif ! is_num "$max_days"; then
+        result_warn "PASS_MAX_DAYS = '$max_days' — не число, проверьте /etc/login.defs"
     elif (( max_days <= PASS_MAX_AGE )); then
         result_pass "PASS_MAX_DAYS = $max_days (≤ ${PASS_MAX_AGE} дней)"
     else
         result_fail "PASS_MAX_DAYS = $max_days (требуется ≤ ${PASS_MAX_AGE})"
-        add_fix "Установить PASS_MAX_DAYS=${PASS_MAX_AGE} в /etc/login.defs" "sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t${PASS_MAX_AGE}/' /etc/login.defs"
+        add_fix "Установить PASS_MAX_DAYS=${PASS_MAX_AGE} в /etc/login.defs" "password"
     fi
 
     # PASS_MIN_DAYS
@@ -199,11 +305,14 @@ check_password_policy() {
     min_days=$(grep -E "^PASS_MIN_DAYS" "$file" 2>/dev/null | awk '{print $2}' || echo "")
     if [[ -z "$min_days" ]]; then
         result_fail "PASS_MIN_DAYS не задан"
+        add_fix "Установить PASS_MIN_DAYS=${PASS_MIN_AGE} в /etc/login.defs" "password"
+    elif ! is_num "$min_days"; then
+        result_warn "PASS_MIN_DAYS = '$min_days' — не число, проверьте /etc/login.defs"
     elif (( min_days >= PASS_MIN_AGE )); then
         result_pass "PASS_MIN_DAYS = $min_days (≥ ${PASS_MIN_AGE} дней)"
     else
         result_warn "PASS_MIN_DAYS = $min_days (рекомендуется ≥ ${PASS_MIN_AGE})"
-        add_fix "Установить PASS_MIN_DAYS=${PASS_MIN_AGE} в /etc/login.defs" "sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t${PASS_MIN_AGE}/' /etc/login.defs"
+        add_fix "Установить PASS_MIN_DAYS=${PASS_MIN_AGE} в /etc/login.defs" "password"
     fi
 
     # PASS_WARN_AGE
@@ -211,18 +320,23 @@ check_password_policy() {
     warn_age=$(grep -E "^PASS_WARN_AGE" "$file" 2>/dev/null | awk '{print $2}' || echo "")
     if [[ -z "$warn_age" ]]; then
         result_fail "PASS_WARN_AGE не задан"
+        add_fix "Установить PASS_WARN_AGE=${PASS_WARN_AGE} в /etc/login.defs" "password"
+    elif ! is_num "$warn_age"; then
+        result_warn "PASS_WARN_AGE = '$warn_age' — не число, проверьте /etc/login.defs"
     elif (( warn_age >= PASS_WARN_AGE )); then
         result_pass "PASS_WARN_AGE = $warn_age (≥ ${PASS_WARN_AGE} дней)"
     else
         result_warn "PASS_WARN_AGE = $warn_age (рекомендуется ≥ ${PASS_WARN_AGE} дней)"
-        add_fix "Установить PASS_WARN_AGE=${PASS_WARN_AGE} в /etc/login.defs" "sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE\t${PASS_WARN_AGE}/' /etc/login.defs"
+        add_fix "Установить PASS_WARN_AGE=${PASS_WARN_AGE} в /etc/login.defs" "password"
     fi
 
     # PASS_MIN_LEN
     local min_len
     min_len=$(grep -E "^PASS_MIN_LEN" "$file" 2>/dev/null | awk '{print $2}' || echo "")
     if [[ -z "$min_len" ]]; then
-        result_warn "PASS_MIN_LEN не задан в login.defs"
+        result_info "PASS_MIN_LEN не задан в login.defs (на системах с PAM параметр игнорируется — важен minlen из pwquality)"
+    elif ! is_num "$min_len"; then
+        result_warn "PASS_MIN_LEN = '$min_len' — не число"
     elif (( min_len >= MIN_PASS_LEN )); then
         result_pass "PASS_MIN_LEN = $min_len (≥ ${MIN_PASS_LEN})"
     else
@@ -243,7 +357,7 @@ check_password_policy() {
     # SHA_CRYPT_MIN_ROUNDS
     local sha_rounds
     sha_rounds=$(grep -E "^SHA_CRYPT_MIN_ROUNDS" "$file" 2>/dev/null | awk '{print $2}' || echo "")
-    if [[ -n "$sha_rounds" ]]; then
+    if [[ -n "$sha_rounds" ]] && is_num "$sha_rounds"; then
         if (( sha_rounds >= 500000 )); then
             result_pass "SHA_CRYPT_MIN_ROUNDS = $sha_rounds"
         else
@@ -252,6 +366,21 @@ check_password_policy() {
     else
         result_info "SHA_CRYPT_MIN_ROUNDS не задан (используется значение по умолчанию)"
     fi
+}
+
+# Значение параметра pwquality: сначала pwquality.conf (+ pwquality.conf.d),
+# затем — inline-параметры в строках pam_pwquality/pam_cracklib в /etc/pam.d.
+pwq_value() {
+    local key="$1" v="" f
+    for f in /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        v=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$f" 2>/dev/null | tail -1 \
+            | cut -d= -f2- | tr -d '[:space:]')
+        [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+    done
+    v=$(grep -rhE "(pam_pwquality|pam_cracklib)\.so" /etc/pam.d/ 2>/dev/null \
+        | grep -v "^[[:space:]]*#" | grep -oE "${key}=-?[0-9]+" | head -1 | cut -d= -f2)
+    printf '%s' "$v"
 }
 
 # 2. Сложность пароля (PAM / pwquality)
@@ -271,101 +400,71 @@ check_pam_pwquality() {
     result_info "Анализируется: $pwq_conf"
 
     # Проверка наличия libpam-pwquality или pam_cracklib
-    local pam_quality_active=0
     if grep -rq "pam_pwquality\|pam_cracklib" /etc/pam.d/ 2>/dev/null; then
         result_pass "Модуль проверки сложности паролей (pam_pwquality/pam_cracklib) подключён"
-        pam_quality_active=1
     else
         result_fail "Модуль pam_pwquality/pam_cracklib НЕ подключён в PAM"
-        add_fix "Установить и включить libpam-pwquality" "apt-get install -y libpam-pwquality 2>/dev/null || yum install -y pam_pwquality 2>/dev/null; echo 'Установлен libpam-pwquality'"
+        add_fix "Установить и включить модуль проверки сложности паролей" "password"
     fi
 
     # minlen
     local pwq_minlen
-    pwq_minlen=$(grep -rE "^\s*minlen\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
+    pwq_minlen=$(pwq_value minlen)
     if [[ -z "$pwq_minlen" ]]; then
-        pwq_minlen=$(grep -rE "minlen=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "minlen=\K[0-9]+" | head -1)
-    fi
-    if [[ -n "$pwq_minlen" ]]; then
-        if (( pwq_minlen >= MIN_PASS_LEN )); then
-            result_pass "minlen = $pwq_minlen (≥ ${MIN_PASS_LEN})"
-        else
-            result_fail "minlen = $pwq_minlen (требуется ≥ ${MIN_PASS_LEN})"
-        add_fix "Установить minlen=${MIN_PASS_LEN} в /etc/security/pwquality.conf" "grep -q '^minlen' /etc/security/pwquality.conf && sed -i 's/^minlen.*/minlen = ${MIN_PASS_LEN}/' /etc/security/pwquality.conf || echo 'minlen = ${MIN_PASS_LEN}' >> /etc/security/pwquality.conf"
-        fi
-    else
         result_warn "minlen не задан в pwquality.conf"
+        add_fix "Установить minlen=${MIN_PASS_LEN} в /etc/security/pwquality.conf" "password"
+    elif ! is_num "$pwq_minlen"; then
+        result_warn "minlen = '$pwq_minlen' — не число"
+    elif (( pwq_minlen >= MIN_PASS_LEN )); then
+        result_pass "minlen = $pwq_minlen (≥ ${MIN_PASS_LEN})"
+    else
+        result_fail "minlen = $pwq_minlen (требуется ≥ ${MIN_PASS_LEN})"
+        add_fix "Установить minlen=${MIN_PASS_LEN} в /etc/security/pwquality.conf" "password"
     fi
 
-    # Заглавные буквы (ucredit)
-    local ucredit
-    ucredit=$(grep -rE "^\s*ucredit\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
-    [[ -z "$ucredit" ]] && ucredit=$(grep -rE "ucredit=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "ucredit=\K[-0-9]+" | head -1)
-    if (( REQUIRE_UPPERCASE == 1 )); then
-        if [[ -n "$ucredit" ]] && (( ucredit <= -1 )); then
-            result_pass "ucredit = $ucredit (заглавные буквы обязательны)"
+    # Классы символов: ucredit/lcredit/dcredit/ocredit.
+    # Отрицательное значение = «столько символов класса ОБЯЗАТЕЛЬНО»,
+    # положительное = «бонус к длине», поэтому требование выполнено при <= -1.
+    local cred key label reqvar cur
+    for cred in "ucredit:ЗАГЛАВНЫЕ буквы:REQUIRE_UPPERCASE" \
+                "lcredit:строчные буквы:REQUIRE_LOWERCASE" \
+                "dcredit:цифры:REQUIRE_DIGITS" \
+                "ocredit:спецсимволы:REQUIRE_SPECIAL"; do
+        key="${cred%%:*}"
+        label="$(cut -d: -f2 <<< "$cred")"
+        reqvar="${cred##*:}"
+        (( ${!reqvar} == 1 )) || continue
+        cur="$(pwq_value "$key")"
+        if is_num "$cur" && (( cur <= -1 )); then
+            result_pass "${key} = ${cur} (${label} обязательны)"
         else
-            result_fail "ucredit не требует заглавных букв (текущее: ${ucredit:-не задано})"
-        add_fix "Требовать заглавные буквы (ucredit=-1)" "grep -q '^ucredit' /etc/security/pwquality.conf && sed -i 's/^ucredit.*/ucredit = -1/' /etc/security/pwquality.conf || echo 'ucredit = -1' >> /etc/security/pwquality.conf"
+            result_fail "${key} не требует обязательных символов класса «${label}» (текущее: ${cur:-не задано})"
+            add_fix "Требовать ${label} (${key}=-1)" "password"
         fi
-    fi
-
-    # Строчные буквы (lcredit)
-    local lcredit
-    lcredit=$(grep -rE "^\s*lcredit\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
-    [[ -z "$lcredit" ]] && lcredit=$(grep -rE "lcredit=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "lcredit=\K[-0-9]+" | head -1)
-    if (( REQUIRE_LOWERCASE == 1 )); then
-        if [[ -n "$lcredit" ]] && (( lcredit <= -1 )); then
-            result_pass "lcredit = $lcredit (строчные буквы обязательны)"
-        else
-            result_fail "lcredit не требует строчных букв (текущее: ${lcredit:-не задано})"
-        fi
-    fi
-
-    # Цифры (dcredit)
-    local dcredit
-    dcredit=$(grep -rE "^\s*dcredit\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
-    [[ -z "$dcredit" ]] && dcredit=$(grep -rE "dcredit=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "dcredit=\K[-0-9]+" | head -1)
-    if (( REQUIRE_DIGITS == 1 )); then
-        if [[ -n "$dcredit" ]] && (( dcredit <= -1 )); then
-            result_pass "dcredit = $dcredit (цифры обязательны)"
-        else
-            result_fail "dcredit не требует цифр (текущее: ${dcredit:-не задано})"
-        add_fix "Требовать цифры (dcredit=-1)" "grep -q '^dcredit' /etc/security/pwquality.conf && sed -i 's/^dcredit.*/dcredit = -1/' /etc/security/pwquality.conf || echo 'dcredit = -1' >> /etc/security/pwquality.conf"
-        fi
-    fi
-
-    # Спецсимволы (ocredit)
-    local ocredit
-    ocredit=$(grep -rE "^\s*ocredit\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | head -1)
-    [[ -z "$ocredit" ]] && ocredit=$(grep -rE "ocredit=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "ocredit=\K[-0-9]+" | head -1)
-    if (( REQUIRE_SPECIAL == 1 )); then
-        if [[ -n "$ocredit" ]] && (( ocredit <= -1 )); then
-            result_pass "ocredit = $ocredit (спецсимволы обязательны)"
-        else
-            result_fail "ocredit не требует спецсимволов (текущее: ${ocredit:-не задано})"
-        add_fix "Требовать спецсимволы (ocredit=-1)" "grep -q '^ocredit' /etc/security/pwquality.conf && sed -i 's/^ocredit.*/ocredit = -1/' /etc/security/pwquality.conf || echo 'ocredit = -1' >> /etc/security/pwquality.conf"
-        fi
-    fi
+    done
 
     # История паролей (remember)
     local remember
-    remember=$(grep -rE "remember=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "remember=\K[0-9]+" | head -1)
-    if [[ -n "$remember" ]] && (( remember >= PASS_HISTORY )); then
+    remember=$(grep -rhE "remember=[0-9]+" /etc/pam.d/ /etc/security/pwhistory.conf 2>/dev/null \
+        | grep -v "^[[:space:]]*#" | grep -oE "remember=[0-9]+" | head -1 | cut -d= -f2)
+    [[ -z "$remember" ]] && remember=$(sys_kv /etc/security/pwhistory.conf remember)
+    if is_num "$remember" && (( remember >= PASS_HISTORY )); then
         result_pass "История паролей: remember=$remember (≥ ${PASS_HISTORY})"
     else
         result_fail "История паролей не задана или недостаточна (текущее: ${remember:-0}, требуется ≥ ${PASS_HISTORY})"
+        add_fix "Включить историю паролей (remember=${PASS_HISTORY})" "password"
     fi
 
     # Блокировка после неудачных попыток (pam_faillock / pam_tally2)
     if grep -rq "pam_faillock\|pam_tally2" /etc/pam.d/ 2>/dev/null; then
         result_pass "Блокировка после неудачных попыток входа настроена (pam_faillock/pam_tally2)"
         local deny
-        deny=$(grep -rE "deny=" /etc/pam.d/ 2>/dev/null | grep -v "^#" | grep -oP "deny=\K[0-9]+" | head -1)
+        deny=$(grep -rhE "deny=[0-9]+" /etc/pam.d/ 2>/dev/null | grep -v "^[[:space:]]*#" | grep -oE "deny=[0-9]+" | head -1 | cut -d= -f2)
+        [[ -z "$deny" ]] && deny=$(sys_kv /etc/security/faillock.conf deny)
         [[ -n "$deny" ]] && result_info "  Блокировка после $deny неудачных попыток"
     else
         result_fail "pam_faillock/pam_tally2 не настроен — нет блокировки после неудачных попыток"
-        add_fix "Включить pam_faillock (блокировка после 5 неудач на 15 мин)" "pam-auth-update --enable faillock 2>/dev/null; echo 'deny = 5' >> /etc/security/faillock.conf 2>/dev/null; echo 'unlock_time = 900' >> /etc/security/faillock.conf 2>/dev/null; echo 'Faillock настроен'"
+        add_fix "Включить pam_faillock (блокировка после ${FAIL_DENY} неудач на ${FAIL_UNLOCK_MINUTES} мин)" "password"
     fi
 }
 
@@ -380,7 +479,7 @@ check_accounts() {
     if [[ -z "$shell_users" ]]; then
         result_pass "Нет пользователей с интерактивной оболочкой"
     else
-        while IFS=: read -r uname _ uid gid _ home shell; do
+        while IFS=: read -r uname _ uid _ _ home shell; do
             local marker=""
             if (( uid == 0 )); then
                 marker="${RED}[ROOT]${RESET}"
@@ -397,30 +496,43 @@ check_accounts() {
     # Аккаунты без пароля
     result_info "${BOLD}Пользователи без пароля:${RESET}"
     if [[ $EUID -eq 0 ]]; then
-        local nopass
-        nopass=$(awk -F: '($2 == "" || $2 == "!!" || $2 == "!") {print $1}' /etc/shadow 2>/dev/null || echo "")
-        if [[ -z "$nopass" ]]; then
-            result_pass "Все аккаунты имеют пароль (или заблокированы)"
+        # ВАЖНО: пустое поле пароля (вход вообще без пароля) и "!", "!!", "*",
+        # "!<hash>" (учётка ЗАБЛОКИРОВАНА) — принципиально разные вещи.
+        # Старая версия смешивала их и репортила заблокированных как «без пароля».
+        local empty_pw locked_pw real_nopass=0 u u_uid u_shell
+        empty_pw=$(awk -F: '$2 == "" {print $1}' /etc/shadow 2>/dev/null)
+        locked_pw=$(awk -F: '$2 ~ /^[!*]/ {print $1}' /etc/shadow 2>/dev/null)
+
+        if [[ -z "$empty_pw" ]]; then
+            result_pass "Учётных записей с пустым паролем не обнаружено"
         else
-            local real_nopass=0
             while read -r u; do
-                # Получаем UID пользователя
-                local u_uid
+                [[ -n "$u" ]] || continue
                 u_uid=$(awk -F: -v user="$u" '$1==user{print $3}' /etc/passwd 2>/dev/null)
-                local u_shell
                 u_shell=$(awk -F: -v user="$u" '$1==user{print $7}' /etc/passwd 2>/dev/null)
-                # Системные аккаунты (uid < 1000) с nologin/false — это норма
-                if [[ -n "$u_uid" ]] && (( u_uid < 1000 )) && [[ "$u_shell" =~ nologin|false|/bin/sync ]]; then
-                    result_info "  ${u} (uid=${u_uid}) — системный сервисный аккаунт без пароля ${DIM}[норма]${RESET}"
-                elif [[ -n "$u_uid" ]] && (( u_uid < 1000 )); then
-                    result_warn "  Системный аккаунт '${u}' (uid=${u_uid}) без пароля, shell=${u_shell}"
+                if is_num "$u_uid" && (( u_uid < 1000 )) && [[ "$u_shell" =~ nologin|false|/bin/sync ]]; then
+                    result_warn "  ${u} (uid=${u_uid}) — системный аккаунт с ПУСТЫМ паролем (shell=${u_shell})"
                 else
-                    result_fail "  Пользователь '${u}' (uid=${u_uid}) не имеет пароля!"
+                    result_fail "  Пользователь '${u}' (uid=${u_uid:-?}) не имеет пароля!"
                     real_nopass=$((real_nopass+1))
                     NOPASS_USERS+=("$u")
                 fi
-            done <<< "$nopass"
-            (( real_nopass == 0 )) && result_pass "Интерактивных аккаунтов без пароля не обнаружено"
+            done <<< "$empty_pw"
+        fi
+
+        # Заблокированные — это норма для сервисных учёток, отдельной строкой
+        if [[ -n "$locked_pw" ]]; then
+            local locked_total=0
+            while read -r u; do
+                [[ -n "$u" ]] || continue
+                locked_total=$((locked_total+1))
+            done <<< "$locked_pw"
+            result_info "  Заблокированных учётных записей (пароль отключён): ${locked_total} ${DIM}[норма для сервисных]${RESET}"
+        fi
+
+        if (( real_nopass > 0 )); then
+            add_fix "Заблокировать учётные записи без пароля: ${NOPASS_USERS[*]}" "simple" \
+                "for u in ${NOPASS_USERS[*]}; do passwd -l \"\$u\"; done"
         fi
     else
         result_warn "Требуется root для проверки /etc/shadow"
@@ -431,9 +543,8 @@ check_accounts() {
     result_info "${BOLD}Аккаунты с UID=0 (суперпользователи):${RESET}"
     local uid0
     uid0=$(awk -F: '$3 == 0 {print $1}' /etc/passwd)
-    local uid0_count=0
     while read -r u; do
-        uid0_count=$((uid0_count+1))
+        [[ -n "$u" ]] || continue
         if [[ "$u" == "root" ]]; then
             result_info "  root — стандартный суперпользователь"
         else
@@ -447,7 +558,7 @@ check_accounts() {
     # /etc/securetty удалён в Ubuntu 22+, проверяем несколько источников
     if [[ -f /etc/securetty ]]; then
         local securetty_entries
-        securetty_entries=$(grep -v "^#\|^$" /etc/securetty | wc -l)
+        securetty_entries=$(grep -cv "^#\|^$" /etc/securetty 2>/dev/null || echo 0)
         if (( securetty_entries == 0 )); then
             result_pass "/etc/securetty пуст — прямой root-вход заблокирован"
         else
@@ -490,9 +601,12 @@ check_accounts() {
         local expired_found=0
         while IFS=: read -r uname _ uid _ _ _ shell; do
             [[ "$shell" =~ nologin|false ]] && continue
+            is_num "$uid" || continue
             (( uid < 1000 )) && [[ "$uname" != "root" ]] && continue
             local exp
-            exp=$(chage -l "$uname" 2>/dev/null | grep "Password expires" | awk -F: '{print $2}' | xargs)
+            # LC_ALL=C — иначе на локализованной системе grep по английской
+            # строке "Password expires" не находит ничего и проверка молча пустая
+            exp=$(LC_ALL=C chage -l "$uname" 2>/dev/null | grep "Password expires" | cut -d: -f2- | xargs)
             if [[ "$exp" == "never" || -z "$exp" ]]; then
                 : # не истёк
             elif [[ "$exp" =~ "password must be changed" ]]; then
@@ -521,21 +635,101 @@ check_accounts() {
     fi
 }
 
+# ── Эффективная конфигурация sshd ────────────────────────────────────────────
+# Старая версия читала только /etc/ssh/sshd_config и игнорировала директиву
+# Include, из-за чего на Ubuntu 22+/Debian 12 (где 50-cloud-init.conf и прочие
+# drop-in'ы задают PasswordAuthentication, PermitRootLogin и т.д.) выдавала
+# ложные PASS. Теперь: по возможности `sshd -T` (учитывает Include и дефолты),
+# иначе — склейка sshd_config со всеми Include-файлами.
+SSHD_EFFECTIVE=""
+SSHD_SOURCE=""
+
+build_sshd_effective() {
+    SSHD_EFFECTIVE=""; SSHD_SOURCE=""
+    local main="/etc/ssh/sshd_config"
+    [[ -f "$main" ]] || return 1
+
+    local bin
+    for bin in /usr/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null || true)"; do
+        [[ -n "$bin" && -x "$bin" ]] || continue
+        if [[ $EUID -eq 0 ]]; then
+            SSHD_EFFECTIVE="$("$bin" -T 2>/dev/null)"
+            if [[ -n "$SSHD_EFFECTIVE" ]]; then
+                SSHD_SOURCE="sshd -T"
+                return 0
+            fi
+        fi
+        break
+    done
+
+    # Include раскрывается НА МЕСТЕ: в OpenSSH выигрывает первое вхождение
+    # ключа, поэтому порядок строк принципиален.
+    local line pat inc f
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*[Ii]nclude[[:space:]]+(.*)$ ]]; then
+            pat="${BASH_REMATCH[1]}"
+            for inc in $pat; do
+                [[ "$inc" != /* ]] && inc="/etc/ssh/${inc}"
+                for f in $inc; do
+                    [[ -f "$f" ]] && SSHD_EFFECTIVE+="$(cat "$f" 2>/dev/null)"$'\n'
+                done
+            done
+        else
+            SSHD_EFFECTIVE+="${line}"$'\n'
+        fi
+    done < "$main"
+    SSHD_SOURCE="sshd_config + Include"
+    return 0
+}
+
+# Первое поле значения (PermitRootLogin, Port, MaxAuthTries...)
+get_ssh_param() {
+    local param="$1"
+    if [[ "$SSHD_SOURCE" == "sshd -T" ]]; then
+        awk -v p="${param,,}" 'tolower($1)==p {v=$2} END{ if (v!="") print v }' <<< "$SSHD_EFFECTIVE"
+    else
+        grep -Ei "^[[:space:]]*${param}[[:space:]]" <<< "$SSHD_EFFECTIVE" \
+            | grep -v "^[[:space:]]*#" | head -1 | awk '{print $2}'
+    fi
+}
+
+# Значение целиком (Ciphers, MACs, KexAlgorithms, AllowUsers...)
+get_ssh_param_full() {
+    local param="$1"
+    if [[ "$SSHD_SOURCE" == "sshd -T" ]]; then
+        awk -v p="${param,,}" 'tolower($1)==p { $1=""; sub(/^[[:space:]]+/,""); v=$0 } END{ if (v!="") print v }' <<< "$SSHD_EFFECTIVE"
+    else
+        grep -Ei "^[[:space:]]*${param}[[:space:]]" <<< "$SSHD_EFFECTIVE" \
+            | grep -v "^[[:space:]]*#" | head -1 | sed -E 's/^[[:space:]]*[^[:space:]]+[[:space:]]+//'
+    fi
+}
+
+# Записывает директиву так, чтобы она гарантированно победила: в OpenSSH
+# выигрывает ПЕРВОЕ вхождение, а Include обычно стоит в начале sshd_config —
+# поэтому конфликтующие строки в drop-in'ах комментируются, а наша строка
+# вставляется первой строкой основного файла (до Include и до любого Match).
+ssh_set_param() {
+    local key="$1" val="$2" main="/etc/ssh/sshd_config" f
+    [[ -f "$main" ]] || return 1
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        sed -i -E "s|^([[:space:]]*${key}[[:space:]].*)$|# disabled by security_audit: \\1|I" "$f"
+    done
+    sed -i -E "/^[[:space:]]*#?[[:space:]]*${key}[[:space:]]/Id" "$main"
+    sed -i "1i ${key} ${val}" "$main"
+}
+
 # 4. SSH конфигурация
 check_ssh() {
     section "КОНФИГУРАЦИЯ SSH"
 
-    local sshd_conf="/etc/ssh/sshd_config"
-    if [[ ! -f "$sshd_conf" ]]; then
+    if [[ ! -f /etc/ssh/sshd_config ]]; then
         result_warn "SSH не установлен или конфиг не найден"
         return
     fi
-
-    # Вспомогательная функция получения значения из sshd_config
-    get_ssh_param() {
-        local param="$1"
-        grep -Ei "^\s*${param}\s" "$sshd_conf" 2>/dev/null | tail -1 | awk '{print $2}'
-    }
+    build_sshd_effective || { result_warn "Не удалось прочитать конфигурацию sshd"; return; }
+    result_info "Источник конфигурации: ${SSHD_SOURCE}"
+    [[ "$SSHD_SOURCE" != "sshd -T" ]] && result_info "${DIM}  (запуск от root даёт точную эффективную конфигурацию через sshd -T)${RESET}"
 
     # Root login
     local root_login
@@ -548,7 +742,7 @@ check_ssh() {
         result_warn "PermitRootLogin = $root_login (допускает root по ключу)"
     else
         result_fail "PermitRootLogin = $root_login (рекомендуется 'no')"
-        add_fix "Запретить прямой root-вход SSH (PermitRootLogin no)" "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload sshd 2>/dev/null || service sshd reload 2>/dev/null"
+        add_fix "Запретить прямой root-вход SSH (PermitRootLogin no)" "ssh" "ssh_set_param PermitRootLogin no"
     fi
 
     # Пустые пароли
@@ -558,7 +752,7 @@ check_ssh() {
         result_pass "PermitEmptyPasswords = ${empty_pw:-no (по умолчанию)}"
     else
         result_fail "PermitEmptyPasswords = $empty_pw — КРИТИЧНО!"
-        add_fix "Запретить пустые пароли SSH (PermitEmptyPasswords no)" "sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config && systemctl reload sshd 2>/dev/null || service sshd reload 2>/dev/null"
+        add_fix "Запретить пустые пароли SSH (PermitEmptyPasswords no)" "ssh" "ssh_set_param PermitEmptyPasswords no"
     fi
 
     # Парольная аутентификация
@@ -584,8 +778,12 @@ check_ssh() {
     local client_alive_cnt
     client_alive_int=$(get_ssh_param "ClientAliveInterval")
     client_alive_cnt=$(get_ssh_param "ClientAliveCountMax")
+    # sshd -T всегда печатает clientaliveinterval, и 0 означает «отключено»
+    is_num "$client_alive_int" || client_alive_int=""
+    [[ "$client_alive_int" == "0" ]] && client_alive_int=""
+    is_num "$client_alive_cnt" || client_alive_cnt=""
     local effective_timeout=0
-    if [[ -n "$client_alive_int" && -n "$client_alive_cnt" ]]; then
+    if [[ -n "$client_alive_int" && -n "$client_alive_cnt" ]] && (( client_alive_cnt > 0 )); then
         effective_timeout=$(( client_alive_int * client_alive_cnt ))
     elif [[ -n "$client_alive_int" ]]; then
         effective_timeout=$client_alive_int
@@ -593,7 +791,8 @@ check_ssh() {
 
     if [[ -z "$client_alive_int" ]]; then
         result_fail "ClientAliveInterval не задан — SSH-сессии не прерываются по таймауту"
-        add_fix "Установить таймаут SSH (ClientAliveInterval=300, CountMax=3)" "grep -q '^ClientAliveInterval' /etc/ssh/sshd_config && sed -i 's/^ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config || echo 'ClientAliveInterval 300' >> /etc/ssh/sshd_config; grep -q '^ClientAliveCountMax' /etc/ssh/sshd_config && sed -i 's/^ClientAliveCountMax.*/ClientAliveCountMax 3/' /etc/ssh/sshd_config || echo 'ClientAliveCountMax 3' >> /etc/ssh/sshd_config; systemctl reload sshd 2>/dev/null"
+        add_fix "Установить таймаут SSH (ClientAliveInterval=${SSH_IDLE_TIMEOUT}, CountMax=1)" "ssh" \
+            "ssh_set_param ClientAliveCountMax 1; ssh_set_param ClientAliveInterval ${SSH_IDLE_TIMEOUT}"
     elif (( effective_timeout <= SSH_IDLE_TIMEOUT )); then
         result_pass "Таймаут SSH: ClientAliveInterval=${client_alive_int}×ClientAliveCountMax=${client_alive_cnt:-1} = ${effective_timeout}с (≤ ${SSH_IDLE_TIMEOUT}с)"
     else
@@ -603,13 +802,13 @@ check_ssh() {
     # MaxAuthTries
     local max_auth
     max_auth=$(get_ssh_param "MaxAuthTries")
-    if [[ -z "$max_auth" ]]; then
+    if [[ -z "$max_auth" ]] || ! is_num "$max_auth"; then
         result_warn "MaxAuthTries не задан (по умолчанию 6)"
     elif (( max_auth <= MAX_AUTH_TRIES )); then
         result_pass "MaxAuthTries = $max_auth (≤ ${MAX_AUTH_TRIES})"
     else
         result_fail "MaxAuthTries = $max_auth (рекомендуется ≤ ${MAX_AUTH_TRIES})"
-        add_fix "Установить MaxAuthTries=${MAX_AUTH_TRIES} в sshd_config" "sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries ${MAX_AUTH_TRIES}/' /etc/ssh/sshd_config && systemctl reload sshd 2>/dev/null"
+        add_fix "Установить MaxAuthTries=${MAX_AUTH_TRIES} в sshd_config" "ssh" "ssh_set_param MaxAuthTries ${MAX_AUTH_TRIES}"
     fi
 
     # Protocol / версия
@@ -660,8 +859,11 @@ check_ssh() {
     # LoginGraceTime
     local grace
     grace=$(get_ssh_param "LoginGraceTime")
-    if [[ -z "$grace" ]]; then
-        result_warn "LoginGraceTime не задан (по умолчанию 120с)"
+    grace="${grace%s}"
+    if [[ -z "$grace" ]] || ! is_num "$grace"; then
+        result_warn "LoginGraceTime не задан или задан в нечисловом формате (по умолчанию 120с)"
+    elif (( grace == 0 )); then
+        result_fail "LoginGraceTime = 0 (время на аутентификацию не ограничено)"
     elif (( grace <= 60 )); then
         result_pass "LoginGraceTime = ${grace}с"
     else
@@ -670,8 +872,8 @@ check_ssh() {
 
     # AllowUsers / AllowGroups
     local allow_users allow_groups
-    allow_users=$(get_ssh_param "AllowUsers")
-    allow_groups=$(get_ssh_param "AllowGroups")
+    allow_users=$(get_ssh_param_full "AllowUsers")
+    allow_groups=$(get_ssh_param_full "AllowGroups")
     if [[ -n "$allow_users" || -n "$allow_groups" ]]; then
         result_pass "Ограничение доступа: AllowUsers='${allow_users:-}' AllowGroups='${allow_groups:-}'"
     else
@@ -680,7 +882,7 @@ check_ssh() {
 
     # Banner
     local banner
-    banner=$(get_ssh_param "Banner")
+    banner=$(get_ssh_param_full "Banner")
     if [[ -n "$banner" && "$banner" != "none" ]]; then
         result_pass "Баннер SSH настроен: $banner"
     else
@@ -699,7 +901,9 @@ check_shell_timeout() {
     for f in /etc/profile /etc/bashrc /etc/bash.bashrc /etc/profile.d/*.sh; do
         [[ -f "$f" ]] || continue
         local val
-        val=$(grep -E "^\s*(export\s+)?TMOUT\s*=" "$f" 2>/dev/null | grep -oP "TMOUT=\K[0-9]+" | head -1)
+        val=$(grep -E "^[[:space:]]*(export[[:space:]]+)?(readonly[[:space:]]+)?TMOUT[[:space:]]*=" "$f" 2>/dev/null \
+              | tail -1 | sed -E 's/.*TMOUT[[:space:]]*=[[:space:]]*([0-9]+).*/\1/')
+        is_num "$val" || val=""
         if [[ -n "$val" ]]; then
             tmout_val="$val"
             timeout_found=1
@@ -709,8 +913,9 @@ check_shell_timeout() {
 
     if [[ "$timeout_found" -eq 0 ]]; then
         result_fail "TMOUT не задан в глобальных профилях — shell не завершается по таймауту"
-        add_fix "Установить TMOUT=${SHELL_TIMEOUT} (таймаут shell) в /etc/profile.d/timeout.sh" "echo 'readonly TMOUT=${SHELL_TIMEOUT}' > /etc/profile.d/timeout.sh && chmod 644 /etc/profile.d/timeout.sh"
-    elif [[ -n "$tmout_val" ]] && (( tmout_val <= SHELL_TIMEOUT )); then
+        add_fix "Установить TMOUT=${SHELL_TIMEOUT} (таймаут shell) в /etc/profile.d/timeout.sh" "simple" \
+            "printf 'readonly TMOUT=%s\\nexport TMOUT\\n' '${SHELL_TIMEOUT}' > /etc/profile.d/timeout.sh && chmod 644 /etc/profile.d/timeout.sh"
+    elif [[ -n "$tmout_val" ]] && is_num "$tmout_val" && (( tmout_val <= SHELL_TIMEOUT )); then
         result_pass "Таймаут shell TMOUT=${tmout_val}с (≤ ${SHELL_TIMEOUT}с)"
     else
         result_fail "Таймаут shell TMOUT=${tmout_val}с слишком велик (требуется ≤ ${SHELL_TIMEOUT}с)"
@@ -762,7 +967,8 @@ check_firewall() {
     # iptables
     if command -v iptables &>/dev/null; then
         local ipt_rules
-        ipt_rules=$(iptables -L INPUT --line-numbers 2>/dev/null | grep -c "^[0-9]" || echo 0)
+        ipt_rules=$(iptables -L INPUT --line-numbers 2>/dev/null | grep -c "^[0-9]")
+        ipt_rules="${ipt_rules:-0}"
         if (( ipt_rules > 0 )); then
             result_pass "iptables: $ipt_rules правил в цепочке INPUT"
             fw_active=1
@@ -771,13 +977,23 @@ check_firewall() {
         fi
     fi
 
-    (( fw_active == 0 )) && result_fail "Ни один брандмауэр не обнаружен в активном состоянии!"
-        add_fix "Включить UFW (минимальные правила: deny all in, allow ssh)" "ufw --force reset; ufw default deny incoming; ufw default allow outgoing; ufw allow ssh; ufw --force enable"
+    # БЫЛО: add_fix стоял вне if из-за сбитого отступа и добавлялся всегда —
+    # то есть скрипт предлагал сбросить работающий firewall (`ufw --force reset`).
+    if (( fw_active == 0 )); then
+        result_fail "Ни один брандмауэр не обнаружен в активном состоянии!"
+        if command -v ufw &>/dev/null; then
+            add_fix "Включить UFW (deny incoming, allow outgoing, allow ssh)" "firewall" \
+                "ufw --force reset; ufw default deny incoming; ufw default allow outgoing; ufw allow ssh; ufw --force enable"
+        else
+            result_info "ufw не установлен — автоисправление недоступно, настройте брандмауэр вручную"
+        fi
+    fi
 
     # IPv6 firewall
     if command -v ip6tables &>/dev/null; then
         local ip6t_rules
-        ip6t_rules=$(ip6tables -L INPUT 2>/dev/null | grep -c "^[A-Z]" || echo 0)
+        ip6t_rules=$(ip6tables -L INPUT 2>/dev/null | grep -c "^[A-Z]")
+        ip6t_rules="${ip6t_rules:-0}"
         if (( ip6t_rules > 2 )); then
             result_pass "ip6tables: правила IPv6 настроены"
         else
@@ -805,19 +1021,33 @@ check_updates() {
             fi
         fi
 
-        # Доступные обновления безопасности
-        if command -v apt-check &>/dev/null; then
+        # Доступные обновления безопасности.
+        # apt-check не в PATH — он лежит в /usr/lib/update-notifier/.
+        local apt_check_bin="" c
+        for c in /usr/lib/update-notifier/apt-check "$(command -v apt-check 2>/dev/null || true)"; do
+            [[ -n "$c" && -x "$c" ]] && { apt_check_bin="$c"; break; }
+        done
+        if [[ -n "$apt_check_bin" ]]; then
             local security_updates
-            security_updates=$(apt-check 2>&1 | awk -F';' '{print $2}')
+            security_updates=$("$apt_check_bin" 2>&1 | awk -F';' '{print $2}')
             if [[ "$security_updates" == "0" ]]; then
                 result_pass "Нет ожидающих обновлений безопасности"
-            else
+            elif is_num "$security_updates"; then
                 result_fail "Ожидает установки обновлений безопасности: $security_updates"
+            fi
+        else
+            local pending
+            pending=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c "^Inst ")
+            is_num "$pending" || pending=0
+            if (( pending == 0 )); then
+                result_pass "Ожидающих обновлений пакетов нет"
+            else
+                result_warn "Ожидает установки обновлений: ${pending} (проверьте, есть ли среди них security)"
             fi
         fi
 
         # unattended-upgrades
-        if dpkg -l unattended-upgrades &>/dev/null 2>&1 && \
+        if dpkg -l unattended-upgrades &>/dev/null 2>&1 &&
            systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
             result_pass "unattended-upgrades активен (автоматические обновления)"
         else
@@ -828,7 +1058,8 @@ check_updates() {
         local pkg_mgr="yum"
         command -v dnf &>/dev/null && pkg_mgr="dnf"
         local sec_updates
-        sec_updates=$($pkg_mgr check-update --security 2>/dev/null | grep -c "^[a-zA-Z]" || echo "?")
+        sec_updates=$($pkg_mgr check-update --security 2>/dev/null | grep -c "^[a-zA-Z]")
+        sec_updates="${sec_updates:-?}"
         result_info "Проверка обновлений безопасности через $pkg_mgr: ~$sec_updates пакетов"
     fi
 }
@@ -879,28 +1110,37 @@ check_services() {
 check_filesystem() {
     section "ФАЙЛОВАЯ СИСТЕМА И ПРАВА ДОСТУПА"
 
-    # SUID/SGID файлы
+    # SUID/SGID файлы.
+    # БЫЛО: `find | grep | while` — тело while крутилось в подоболочке, поэтому
+    # suid_count всегда оставался 0 и печатался PASS даже при найденных файлах.
     result_info "${BOLD}Файлы с SUID/SGID (вне стандартных путей):${RESET}"
-    local suid_count=0
-    find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null | \
-    grep -Ev "^(/usr/bin|/usr/sbin|/bin|/sbin|/usr/lib|/usr/libexec)" | \
+    local suid_count=0 f
+    collect_suid
     while read -r f; do
+        [[ -n "$f" ]] || continue
         result_warn "  SUID/SGID: $f"
-        suid_count=$((suid_count+1)) || true
-    done
+        suid_count=$((suid_count+1))
+    done < <(grep -Ev "^(/usr/bin|/usr/sbin|/bin|/sbin|/usr/lib|/usr/libexec)" <<< "$SUID_CACHE")
     (( suid_count == 0 )) && result_pass "Нестандартных SUID/SGID файлов не обнаружено"
 
     echo ""
     # Мировозаписываемые файлы
     result_info "${BOLD}Мировозаписываемые файлы (world-writable):${RESET}"
-    local ww_files
-    ww_files=$(find / -xdev -perm -o+w -not -type l -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null | head -20)
+    local ww_files ww_total
+    # sticky-bit каталоги (/tmp и т.п.) исключаем — это штатная конфигурация
+    ww_total=$(find / -xdev -perm -o+w ! -type l ! -perm -1000 \
+        -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null | wc -l)
+    ww_files=$(find / -xdev -perm -o+w ! -type l ! -perm -1000 \
+        -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null | head -20)
     if [[ -z "$ww_files" ]]; then
         result_pass "Мировозаписываемых файлов не обнаружено"
     else
-        echo "$ww_files" | while read -r f; do
+        while read -r f; do
+            [[ -n "$f" ]] || continue
             result_warn "  world-writable: $f"
-        done
+        done <<< "$ww_files"
+        is_num "$ww_total" && (( ww_total > 20 )) && \
+            result_info "  ...показаны первые 20 из ${ww_total}"
     fi
 
     echo ""
@@ -981,8 +1221,11 @@ check_kernel() {
             result_info "$param недоступен в данной системе"
         else
             result_fail "$desc — $param = $actual (ожидается $expected)"
-            add_fix "Установить ${param}=${expected} (${desc})" \
-                "sysctl -w '${param}=${expected}'; grep -q '${param}' /etc/sysctl.conf && sed -i 's|${param}.*|${param}=${expected}|' /etc/sysctl.conf || echo '${param}=${expected}' >> /etc/sysctl.conf"
+            # БЫЛО: sed 's|param.*|param=X|' по /etc/sysctl.conf правил и
+            # закомментированные строки (#net.ipv4... → #net.ipv4...=0), т.е.
+            # «исправление» молча не применялось после перезагрузки.
+            add_fix "Установить ${param}=${expected} (${desc})" "simple" \
+                "sysctl -w '${param}=${expected}' >/dev/null && sysctl_persist '${param}' '${expected}'"
         fi
     done
 }
@@ -996,14 +1239,14 @@ check_logging() {
         if systemctl is-active --quiet auditd 2>/dev/null; then
             result_pass "auditd активен"
             local audit_rules
-            audit_rules=$(auditctl -l 2>/dev/null | grep -v "^No rules" | wc -l)
+            audit_rules=$(auditctl -l 2>/dev/null | grep -cv "^No rules")
             result_info "  Правил аудита: $audit_rules"
         else
             result_fail "auditd установлен, но НЕ запущен"
         fi
     else
         result_warn "auditd не установлен (рекомендуется для STIG/CIS)"
-        add_fix "Установить и включить auditd" "apt-get install -y auditd audispd-plugins 2>/dev/null || yum install -y audit 2>/dev/null; systemctl enable --now auditd"
+        add_fix "Установить и включить auditd" "simple" "apt-get install -y auditd audispd-plugins 2>/dev/null || yum install -y audit 2>/dev/null; systemctl enable --now auditd"
     fi
 
     # rsyslog / syslog-ng
@@ -1013,7 +1256,7 @@ check_logging() {
         result_pass "syslog-ng активен"
     else
         result_fail "rsyslog/syslog-ng не запущен — системные логи могут не писаться"
-        add_fix "Установить и запустить rsyslog" "apt-get install -y rsyslog 2>/dev/null || yum install -y rsyslog 2>/dev/null; systemctl enable --now rsyslog"
+        add_fix "Установить и запустить rsyslog" "simple" "apt-get install -y rsyslog 2>/dev/null || yum install -y rsyslog 2>/dev/null; systemctl enable --now rsyslog"
     fi
 
     # journald
@@ -1083,7 +1326,8 @@ check_encryption() {
 
     if command -v lsblk &>/dev/null; then
         local encrypted
-        encrypted=$(lsblk -o TYPE 2>/dev/null | grep -c "crypt" || echo 0)
+        encrypted=$(lsblk -o TYPE 2>/dev/null | grep -c "crypt")
+        encrypted="${encrypted:-0}"
         if (( encrypted > 0 )); then
             result_pass "Обнаружено $encrypted зашифрованных раздела (dm-crypt/LUKS)"
             lsblk -o NAME,TYPE,SIZE,MOUNTPOINT 2>/dev/null | grep "crypt" | while read -r line; do
@@ -1114,9 +1358,9 @@ check_cron() {
     # Разрешения cron
     if [[ -f /etc/cron.allow ]]; then
         result_pass "/etc/cron.allow существует (ограниченный список)"
-        cat /etc/cron.allow | while read -r u; do
-            result_info "  cron.allow: $u"
-        done
+        while read -r u; do
+            [[ -n "$u" ]] && result_info "  cron.allow: $u"
+        done < /etc/cron.allow
     elif [[ -f /etc/cron.deny ]]; then
         result_warn "/etc/cron.deny используется (менее безопасно, чем cron.allow)"
     else
@@ -1126,8 +1370,9 @@ check_cron() {
     # Пользовательские crontab
     result_info "${BOLD}Пользовательские crontab:${RESET}"
     if [[ -d /var/spool/cron/crontabs ]]; then
-        ls /var/spool/cron/crontabs/ 2>/dev/null | while read -r u; do
-            result_warn "  Пользовательский crontab: $u"
+        local ctab
+        for ctab in /var/spool/cron/crontabs/*; do
+            [[ -f "$ctab" ]] && result_warn "  Пользовательский crontab: $(basename "$ctab")"
         done
     fi
 }
@@ -1177,17 +1422,14 @@ check_network() {
 check_ssh_crypto() {
     section "КРИПТОГРАФИЯ SSH"
 
-    # Слабые алгоритмы
     local sshd_conf="/etc/ssh/sshd_config"
-    [[ ! -f "$sshd_conf" ]] && return
-
-    get_ssh_param() {
-        grep -Ei "^\s*${1}\s" "$sshd_conf" 2>/dev/null | tail -1 | cut -d' ' -f2-
-    }
+    [[ -f "$sshd_conf" ]] || { result_warn "SSH не установлен или конфиг не найден"; return; }
+    # check_ssh_crypto может вызываться отдельно (пункт меню 3 и --ssh)
+    [[ -n "$SSHD_EFFECTIVE" ]] || build_sshd_effective || return
 
     # Ciphers
     local ciphers
-    ciphers=$(get_ssh_param "Ciphers")
+    ciphers=$(get_ssh_param_full "Ciphers")
     if [[ -n "$ciphers" ]]; then
         if echo "$ciphers" | grep -qi "3des\|blowfish\|arcfour\|cast128"; then
             result_fail "Слабые шифры в Ciphers: $ciphers"
@@ -1200,7 +1442,7 @@ check_ssh_crypto() {
 
     # MACs
     local macs
-    macs=$(get_ssh_param "MACs")
+    macs=$(get_ssh_param_full "MACs")
     if [[ -n "$macs" ]]; then
         if echo "$macs" | grep -qi "hmac-md5\|hmac-sha1"; then
             result_fail "Слабые MAC в MACs: $macs"
@@ -1213,7 +1455,7 @@ check_ssh_crypto() {
 
     # KexAlgorithms
     local kex
-    kex=$(get_ssh_param "KexAlgorithms")
+    kex=$(get_ssh_param_full "KexAlgorithms")
     if [[ -n "$kex" ]]; then
         if echo "$kex" | grep -qi "diffie-hellman-group1\|diffie-hellman-group14"; then
             result_fail "Слабые KexAlgorithms: $kex"
@@ -1225,7 +1467,7 @@ check_ssh_crypto() {
     fi
 
     # HostKey - DSA
-    if grep -qi "HostKey.*ssh_host_dsa_key" "$sshd_conf" 2>/dev/null; then
+    if grep -qi "HostKey.*ssh_host_dsa_key" <<< "$SSHD_EFFECTIVE"; then
         result_fail "Используется устаревший DSA HostKey"
     else
         result_pass "DSA HostKey не используется"
@@ -1263,22 +1505,535 @@ print_summary() {
     log ""
 }
 
-# ─────────────────────────── МЕНЮ ВЫБОРА ПРОВЕРОК ───────────────────────────
-
-
 # ─────────────────────────── МЕХАНИЗМ ИСПРАВЛЕНИЙ ───────────────────────────
 
-# Глобальный список: каждый элемент = "описание|||команда"
+# Глобальные списки: каждый элемент = "описание|||команда"
 FIXES=()
+FIXES_SSH=()
+FIXES_FW=()
+PASS_POLICY_ISSUES=0
 
+
+# Категории:
+#   password  — попадает в PASS_POLICY_ISSUES, реального fix-а тут нет:
+#               при обнаружении проблем предлагается запустить apply_password_policy()
+#               (весь безопасный движок, а не точечный sed)
+#   ssh       — идёт в safe_apply_batch "ssh" (бэкап sshd_config, sshd -t, предохранитель)
+#   firewall  — идёт в safe_apply_batch "firewall" (бэкап правил, предохранитель)
+#   simple    — как раньше: показать команду, применить по одиночному подтверждению
 add_fix() {
     local desc="$1"
-    local cmd="$2"
-    FIXES+=("${desc}|||${cmd}")
+    local category="$2"
+    local cmd="${3:-}"   # для категории password команда не нужна — см. ниже
+    case "$category" in
+        password) PASS_POLICY_ISSUES=$((PASS_POLICY_ISSUES+1)) ;;
+        ssh)      FIXES_SSH+=("${desc}|||${cmd}") ;;
+        firewall) FIXES_FW+=("${desc}|||${cmd}") ;;
+        *)        FIXES+=("${desc}|||${cmd}") ;;
+    esac
 }
 
-# Вызывается после всех проверок — предлагает исправления
+# ══════════════════════════════════════════════════════════════════════════
+# БЕЗОПАСНЫЙ ДВИЖОК ПРИМЕНЕНИЯ (обобщён из pass_polic.sh)
+#
+# Применяется к трём "критическим" категориям — password (PAM/парольная
+# политика), ssh, firewall. Общая схема для всех трёх:
+#   1) бэкап затронутых файлов/правил
+#   2) сами изменения выполняются в защищённом подпроцессе с `set -e`,
+#      чтобы любая упавшая команда сразу остановила применение, не оставляя
+#      систему в наполовину настроенном состоянии
+#   3) при ошибке — немедленный откат из бэкапа
+#   4) при успехе — предохранитель: ждём подтверждения из НОВОГО сеанса
+#      (что вход/sudo всё ещё работают), иначе автооткат по таймауту
+#
+# Категория "simple" (всё остальное: ядро, ФС, логи, cron, NTP, DNS, MAC,
+# бэкдоры) через этот движок не проходит — там как раньше, разовое
+# подтверждение и прямое применение без бэкапа/отката.
+# ══════════════════════════════════════════════════════════════════════════
+
+SAFE_BACKUP_DIR=""
+SAFE_MARKER=""
+SAFE_GUARD_PID=""
+SAFE_PENDING_CATEGORY=""
+
+# Если скрипт завершится (в т.ч. по Ctrl-C) с неподтверждёнными изменениями —
+# откатываем их сами, не дожидаясь фонового сторожа.
+cleanup_pending() {
+    local rc=$?
+    if [[ -n "$SAFE_MARKER" && -f "$SAFE_MARKER" ]]; then
+        rm -f "$SAFE_MARKER" 2>/dev/null
+        echo ""
+        result_warn "Выход с неподтверждёнными изменениями (${SAFE_PENDING_CATEGORY}) — откатываю."
+        safe_restore_backup "$SAFE_PENDING_CATEGORY"
+    fi
+    [[ -n "$SAFE_GUARD_PID" ]] && kill "$SAFE_GUARD_PID" 2>/dev/null
+    SAFE_GUARD_PID=""
+    return $rc
+}
+trap cleanup_pending EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+safe_tracked_files() {
+    case "$1" in
+        password) echo "/etc/security/pwquality.conf /etc/security/faillock.conf /etc/security/pwhistory.conf /etc/login.defs /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth" ;;
+        ssh)      echo "/etc/ssh/sshd_config" ;;
+        firewall) echo "" ;;
+    esac
+}
+
+safe_make_backup() {
+    local category="$1"
+    SAFE_BACKUP_DIR="/root/security-toolkit-backup-$(date +%Y%m%d-%H%M%S)-${category}"
+    if ! mkdir -p "$SAFE_BACKUP_DIR" 2>/dev/null; then
+        SAFE_BACKUP_DIR="/var/tmp/security-toolkit-backup-$(date +%Y%m%d-%H%M%S)-${category}"
+        mkdir -p "$SAFE_BACKUP_DIR" 2>/dev/null || { result_fail "Не удалось создать каталог бэкапа"; return 1; }
+    fi
+    chmod 700 "$SAFE_BACKUP_DIR" 2>/dev/null || true
+    local f safe
+    for f in $(safe_tracked_files "$category"); do
+        [[ -e "$f" ]] || continue
+        safe="${f//\//__}"
+        cp -a "$f" "$SAFE_BACKUP_DIR/$safe" 2>/dev/null || true
+    done
+    if [[ "$category" == "firewall" ]]; then
+        command -v ufw &>/dev/null && ufw status verbose > "$SAFE_BACKUP_DIR/ufw.status" 2>/dev/null
+        command -v iptables-save &>/dev/null && iptables-save > "$SAFE_BACKUP_DIR/iptables.rules" 2>/dev/null
+        command -v nft &>/dev/null && nft list ruleset > "$SAFE_BACKUP_DIR/nft.ruleset" 2>/dev/null
+    fi
+    if [[ "$category" == "password" ]] && command -v authselect &>/dev/null; then
+        authselect current 2>/dev/null > "$SAFE_BACKUP_DIR/authselect.current"
+    fi
+    result_info "Бэкап (${category}) создан: $SAFE_BACKUP_DIR"
+    return 0
+}
+
+safe_restore_backup() {
+    local category="$1"
+    [[ -d "$SAFE_BACKUP_DIR" ]] || return 0
+    if [[ "$category" == "password" && -f "$SAFE_BACKUP_DIR/authselect.added" ]] && command -v authselect &>/dev/null; then
+        while IFS= read -r feat; do
+            [[ -n "$feat" ]] && authselect disable-feature "$feat" >/dev/null 2>&1
+        done < "$SAFE_BACKUP_DIR/authselect.added"
+        authselect apply-changes -b >/dev/null 2>&1
+    fi
+    local f safe
+    for f in $(safe_tracked_files "$category"); do
+        safe="${f//\//__}"
+        [[ -e "$SAFE_BACKUP_DIR/$safe" ]] && cp -a "$SAFE_BACKUP_DIR/$safe" "$f" 2>/dev/null
+    done
+    if [[ "$category" == "firewall" ]]; then
+        [[ -f "$SAFE_BACKUP_DIR/iptables.rules" ]] && command -v iptables-restore &>/dev/null \
+            && iptables-restore < "$SAFE_BACKUP_DIR/iptables.rules" 2>/dev/null
+        [[ -f "$SAFE_BACKUP_DIR/nft.ruleset" ]] && command -v nft &>/dev/null \
+            && nft -f "$SAFE_BACKUP_DIR/nft.ruleset" 2>/dev/null
+        [[ -f "$SAFE_BACKUP_DIR/ufw.status" ]] && result_info "Правила ufw до изменений сохранены в ${SAFE_BACKUP_DIR}/ufw.status (восстановите вручную при необходимости)"
+    fi
+    if [[ "$category" == "ssh" ]]; then
+        systemctl reload sshd 2>/dev/null || service sshd reload 2>/dev/null || true
+    fi
+    command -v faillock &>/dev/null && faillock --reset >/dev/null 2>&1
+    result_warn "Файлы категории '${category}' восстановлены из ${SAFE_BACKUP_DIR}"
+}
+
+# Предохранитель: ждём подтверждения из НОВОГО сеанса, иначе — автооткат по таймауту.
+safe_confirm_or_rollback() {
+    local category="$1"
+    if [[ "$DO_ROLLBACK_GUARD" -ne 1 ]]; then
+        result_warn "Предохранитель отключён — изменения применены без окна отката. Бэкап: ${SAFE_BACKUP_DIR}"
+        return 0
+    fi
+    SAFE_MARKER="$(mktemp /var/tmp/security_toolkit_pending.XXXXXX)"
+    SAFE_PENDING_CATEGORY="$category"
+    # БЫЛО: сторож спал ровно CONFIRM_TIMEOUT — столько же, сколько ждал `read -t`,
+    # то есть срабатывал одновременно с вводом «YES» (гонка). Даём ему запас.
+    local guard_timeout=$(( CONFIRM_TIMEOUT + 15 ))
+    (
+        sleep "$guard_timeout"
+        [[ -f "$SAFE_MARKER" ]] || exit 0
+        {
+            echo "[$(date)] АВТО-ОТКАТ (${category}): подтверждение не получено за ${guard_timeout}с"
+            # БЫЛО: в bash -c передавались только safe_* функции, а они зовут
+            # result_warn/result_info — в фоновой оболочке их не было, откат
+            # сыпал «command not found». Подкладываем заглушки.
+            SAFE_BACKUP_DIR="$SAFE_BACKUP_DIR" bash -c "
+                result_pass() { echo \"[pass] \$*\"; }
+                result_fail() { echo \"[fail] \$*\"; }
+                result_warn() { echo \"[warn] \$*\"; }
+                result_info() { echo \"[info] \$*\"; }
+                $(declare -f safe_tracked_files safe_restore_backup)
+                safe_restore_backup '${category}'
+            "
+        } >> /var/log/security_toolkit_autorollback.log 2>&1
+        rm -f "$SAFE_MARKER" 2>/dev/null
+    ) &
+    SAFE_GUARD_PID=$!
+    disown "$SAFE_GUARD_PID" 2>/dev/null || true
+
+    echo ""
+    echo -e "${RED}${BOLD}============================ ВАЖНО ============================${RESET}"
+    echo -e "${YELLOW}Изменения (${category}) применены, но ЕЩЁ НЕ ЗАФИКСИРОВАНЫ.${RESET}"
+    echo "  1) Откройте НОВОЕ SSH-подключение к серверу, не закрывая текущее."
+    echo "  2) Убедитесь, что вход и sudo всё ещё работают."
+    echo "  3) Вернитесь сюда и подтвердите."
+    echo ""
+    echo -e "У вас ${YELLOW}${CONFIRM_TIMEOUT} сек${RESET}. Иначе — автоматический откат из ${SAFE_BACKUP_DIR}."
+    echo -e "${RED}=================================================================${RESET}"
+
+    local answer=""
+    read -r -t "$CONFIRM_TIMEOUT" -p "Введите YES для фиксации: " answer </dev/tty
+    # Снимаем «неподтверждённое» состояние до любых действий, чтобы ни сторож,
+    # ни trap не откатили уже принятое решение.
+    rm -f "$SAFE_MARKER" 2>/dev/null
+    kill "$SAFE_GUARD_PID" >/dev/null 2>&1
+    SAFE_GUARD_PID=""
+    SAFE_MARKER=""
+    if [[ "${answer^^}" == "YES" ]]; then
+        result_pass "Изменения (${category}) зафиксированы. Бэкап сохранён в ${SAFE_BACKUP_DIR}"
+        return 0
+    else
+        echo ""
+        result_warn "Подтверждение не получено — откатываю немедленно."
+        safe_restore_backup "$category"
+        return 1
+    fi
+}
+
+# ── Помощники специально для password/PAM-модуля ──
+pam_module_exists() {
+    find /lib /lib64 /usr/lib /usr/lib64 -name "$1" 2>/dev/null | grep -q .
+}
+
+is_simple_faillock_wrappable() {
+    [[ -f "$1" ]] && grep -Eq '^auth[[:space:]]+\[success=1 default=ignore\][[:space:]]+pam_unix\.so' "$1"
+}
+
+detect_os_family() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        if [[ "${ID_LIKE:-}" =~ (debian|ubuntu) || "${ID:-}" =~ ^(debian|ubuntu|astra)$ ]]; then
+            echo "debian"
+        elif [[ "${ID_LIKE:-}" =~ (rhel|fedora) || "${ID:-}" =~ ^(centos|rhel|rocky|almalinux|fedora)$ ]]; then
+            echo "rhel"
+        else
+            echo "unknown"
+        fi
+    else
+        echo "unknown"
+    fi
+}
+
+authselect_feature_enabled() {
+    authselect current 2>/dev/null | grep -qE "^[[:space:]]*-[[:space:]]+${1}[[:space:]]*$"
+}
+
+# Все мутирующие шаги парольной/PAM-политики. Выполняется в защищённом
+# подпроцессе с `set -e` — см. apply_password_policy().
+apply_password_policy_body() {
+    local os_family="$1"
+    local fail_unlock_seconds=$(( FAIL_UNLOCK_MINUTES * 60 ))
+
+    if [[ "$os_family" == "debian" ]]; then
+        apt-get update -qq || result_warn "Часть репозиториев недоступна — продолжаю с имеющимися списками"
+        apt-get install -y -qq libpam-pwquality libpam-modules pamtester \
+            || result_warn "Не все пакеты установлены (проверьте libpam-pwquality/libpam-modules)"
+    else
+        dnf install -y libpwquality pam authselect >/dev/null || result_warn "dnf install завершился с предупреждением"
+        dnf install -y pamtester >/dev/null 2>&1 || true
+    fi
+
+    cat > /etc/security/pwquality.conf <<EOF
+minlen = ${MIN_PASS_LEN}
+lcredit = -1
+ucredit = -1
+dcredit = -1
+ocredit = -1
+difok = 3
+retry = 3
+maxrepeat = 2
+usercheck = 1
+dictcheck = 1
+enforce_for_root
+EOF
+    result_pass "pwquality.conf записан (minlen=${MIN_PASS_LEN})"
+
+    cat > /etc/security/faillock.conf <<EOF
+# Управляется security_toolkit.sh
+deny = ${FAIL_DENY}
+unlock_time = ${fail_unlock_seconds}
+fail_interval = 900
+silent
+EOF
+    result_pass "faillock.conf записан (deny=${FAIL_DENY}, unlock_time=${fail_unlock_seconds})"
+
+    if [[ "$os_family" == "rhel" ]]; then
+        local cur_profile
+        cur_profile="$(authselect current 2>/dev/null | awk -F': ' '/Profile/{print $2; exit}')"
+        if [[ -z "$cur_profile" ]]; then
+            result_warn "authselect: активный профиль не найден — faillock/pwhistory в auth-стек не включаю (риск сломать SSSD/AD)"
+        else
+            result_info "Активный профиль authselect: ${cur_profile}"
+            local feat
+            for feat in with-faillock with-pwhistory; do
+                if authselect_feature_enabled "$feat"; then
+                    result_info "authselect: ${feat} уже был включён — оставляю как есть"
+                    continue
+                fi
+                authselect enable-feature "$feat"
+                echo "$feat" >> "$SAFE_BACKUP_DIR/authselect.added"
+            done
+            authselect apply-changes -b
+            result_pass "authselect: применены изменения (with-faillock/with-pwhistory)"
+        fi
+        if [[ -f /etc/security/pwhistory.conf ]]; then
+            sed -i '/^[[:space:]]*remember/d' /etc/security/pwhistory.conf
+        fi
+        echo "remember = ${PASS_HISTORY}" >> /etc/security/pwhistory.conf
+        result_pass "pwhistory.conf: remember=${PASS_HISTORY}"
+    else
+        local common_password=/etc/pam.d/common-password
+        local common_auth=/etc/pam.d/common-auth
+        local common_account=/etc/pam.d/common-account
+
+        [[ -f "$common_password" ]] || { result_fail "$common_password не найден"; return 1; }
+        sed -i '/pam_pwquality\.so/d; /pam_pwhistory\.so/d' "$common_password"
+        if pam_module_exists pam_pwquality.so; then
+            sed -i "/^password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3 enforce_for_root" "$common_password"
+            result_pass "pam_pwquality добавлен в $common_password"
+        else
+            result_warn "pam_pwquality.so не найден на диске — строку не добавляю (нужен libpam-pwquality)"
+        fi
+        if pam_module_exists pam_pwhistory.so; then
+            sed -i "/^password[[:space:]].*pam_unix\.so/i password requisite pam_pwhistory.so remember=${PASS_HISTORY} use_authtok" "$common_password"
+            result_pass "pam_pwhistory добавлен (remember=${PASS_HISTORY})"
+        else
+            result_warn "pam_pwhistory.so не найден на диске — строку не добавляю (нужен libpam-modules)"
+        fi
+
+        [[ -f "$common_auth" ]] || { result_fail "$common_auth не найден"; return 1; }
+        if ! pam_module_exists pam_faillock.so; then
+            result_warn "pam_faillock.so не найден на диске (типично для старых Astra/Debian с pam_tally2) — не трогаю auth-стек"
+        elif ! is_simple_faillock_wrappable "$common_auth"; then
+            result_warn "$common_auth не в штатной идиоме pam_unix success=1 — автоматическую вставку faillock пропускаю (похоже на SSSD/LDAP/AD или нестандартный стек)"
+        else
+            sed -i '/pam_faillock\.so/d' "$common_auth"
+            local wrap_tmp; wrap_tmp="$(mktemp)"
+            awk '
+                /^auth[[:space:]]+\[success=1 default=ignore\][[:space:]]+pam_unix\.so/ && !d {
+                    print "auth    required        pam_faillock.so preauth"
+                    print $0
+                    print "auth    [default=die]   pam_faillock.so authfail"
+                    print "auth    sufficient      pam_faillock.so authsucc"
+                    d=1; next
+                }
+                { print }
+            ' "$common_auth" > "$wrap_tmp"
+            cp -a "$wrap_tmp" "$common_auth"; rm -f "$wrap_tmp"
+            if [[ -f "$common_account" ]]; then
+                sed -i '/pam_faillock\.so/d' "$common_account"
+                echo "account required pam_faillock.so" >> "$common_account"
+            fi
+            result_pass "faillock настроен в $common_auth (+account в $common_account)"
+        fi
+    fi
+
+    local user uid shell
+    while IFS=: read -r user _ uid _ _ _ shell; do
+        [[ "$user" == "root" || "$user" == "nobody" ]] && continue
+        case "$shell" in *nologin|*false|*sync|*shutdown|*halt) continue ;; esac
+        is_num "$uid" || continue
+        (( uid >= UID_MIN )) || continue
+        chage -M "$PASS_MAX_AGE" -m "$PASS_MIN_AGE" -W "$PASS_WARN_AGE" "$user" \
+            || result_warn "chage не применился для $user (пропускаю)"
+    done < /etc/passwd
+    result_pass "Старение паролей применено (UID >= ${UID_MIN})"
+
+    if [[ -f /etc/login.defs ]]; then
+        sed -i '/^PASS_MAX_DAYS/d; /^PASS_MIN_DAYS/d; /^PASS_WARN_AGE/d' /etc/login.defs
+        {
+            echo ""
+            echo "# Password aging (security_toolkit.sh)"
+            echo "PASS_MAX_DAYS   ${PASS_MAX_AGE}"
+            echo "PASS_MIN_DAYS   ${PASS_MIN_AGE}"
+            echo "PASS_WARN_AGE   ${PASS_WARN_AGE}"
+        } >> /etc/login.defs
+        result_pass "login.defs обновлён"
+    fi
+}
+
+validate_pam_stack() {
+    local os_family="$1" f pam_ok=1 auth_files=()
+    if [[ "$os_family" == "debian" ]]; then
+        auth_files=(/etc/pam.d/common-auth /etc/pam.d/common-password)
+    else
+        auth_files=(/etc/pam.d/system-auth /etc/pam.d/password-auth)
+    fi
+    for f in "${auth_files[@]}"; do
+        [[ -f "$f" ]] || continue
+        [[ -s "$f" ]] || { result_fail "$f пуст!"; pam_ok=0; }
+        grep -q 'pam_unix\.so' "$f" || { result_fail "$f не содержит pam_unix.so!"; pam_ok=0; }
+    done
+    if command -v pamtester &>/dev/null; then
+        if pamtester -v login "$(id -un)" account >/dev/null 2>&1; then
+            result_pass "pamtester: базовая проверка account-фазы прошла"
+        else
+            result_warn "pamtester: account-фаза вернула ошибку — проверьте стек вручную"
+        fi
+    fi
+    [[ "$pam_ok" -eq 1 ]]
+}
+
+# Точка входа: полноценный безопасный модуль парольной/PAM-политики,
+# использует пороги, уже собранные в interactive_setup()
+# (MIN_PASS_LEN, PASS_HISTORY, FAIL_DENY, FAIL_UNLOCK_MINUTES,
+#  PASS_MAX_AGE, PASS_MIN_AGE, PASS_WARN_AGE, UID_MIN).
+apply_password_policy() {
+    if [[ $EUID -ne 0 ]]; then
+        result_warn "Для применения парольной/PAM-политики нужен root. Запустите через sudo."
+        return 1
+    fi
+
+    echo ""
+    log "${BOLD}${MAGENTA}══════════ Безопасное применение парольной/PAM-политики ══════════${RESET}"
+    log "  minlen=${MIN_PASS_LEN}  remember=${PASS_HISTORY}  deny=${FAIL_DENY}  unlock=${FAIL_UNLOCK_MINUTES}мин"
+    log "  PASS_MAX_DAYS=${PASS_MAX_AGE}  PASS_MIN_DAYS=${PASS_MIN_AGE}  PASS_WARN_AGE=${PASS_WARN_AGE}  UID_MIN=${UID_MIN}"
+
+    if (( PASS_MIN_AGE >= PASS_MAX_AGE )); then
+        result_fail "PASS_MIN_AGE (${PASS_MIN_AGE}) не может быть >= PASS_MAX_AGE (${PASS_MAX_AGE}) — отменено"
+        return 1
+    fi
+    if ! confirm "Применить парольную/PAM-политику с этими параметрами (бэкап + окно отката ${CONFIRM_TIMEOUT}с)?" n; then
+        result_info "Отменено пользователем."
+        return 0
+    fi
+
+    local os_family
+    os_family="$(detect_os_family)"
+    if [[ "$os_family" == "unknown" ]]; then
+        result_fail "Не удалось определить семейство ОС — модуль поддерживает Debian/Ubuntu/Astra и RHEL/CentOS/Rocky/Alma"
+        return 1
+    fi
+    result_info "Семейство ОС: ${os_family}"
+
+    safe_make_backup "password" || return 1
+
+    ( set -e -o pipefail; apply_password_policy_body "$os_family" )
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        result_fail "Применение парольной/PAM-политики не удалось — откатываю."
+        safe_restore_backup "password"
+        return 1
+    fi
+
+    if ! validate_pam_stack "$os_family"; then
+        result_fail "Структурная проверка PAM не пройдена — откатываю."
+        safe_restore_backup "password"
+        return 1
+    fi
+    result_pass "Структурная проверка PAM пройдена"
+
+    safe_confirm_or_rollback "password"
+}
+
+# Все мутирующие шаги для категорий ssh/firewall — список команд из
+# add_fix(), выполняется в защищённом подпроцессе с `set -e`.
+safe_apply_batch_body() {
+    local -n fixes_ref="$1"
+    local entry desc cmd
+    for entry in "${fixes_ref[@]}"; do
+        desc="${entry%%|||*}"; cmd="${entry##*|||}"
+        result_info "Применяю: ${desc}"
+        eval "$cmd"
+    done
+}
+
+safe_apply_batch() {
+    local category="$1" arrname="$2"
+    local -n fixes_ref="$arrname"
+    [[ ${#fixes_ref[@]} -eq 0 ]] && return 0
+
+    if [[ $EUID -ne 0 ]]; then
+        result_warn "Для безопасного применения (${category}) нужен root. Запустите через sudo."
+        return 1
+    fi
+
+    echo ""
+    log "${BOLD}${MAGENTA}══════════ Безопасное применение: ${category} ══════════${RESET}"
+    local entry
+    for entry in "${fixes_ref[@]}"; do
+        log "  • ${entry%%|||*}"
+    done
+    if ! confirm "Применить все ${#fixes_ref[@]} исправлений категории '${category}' (бэкап + окно отката ${CONFIRM_TIMEOUT}с)?" n; then
+        result_info "Отменено пользователем."
+        return 0
+    fi
+
+    safe_make_backup "$category" || return 1
+
+    ( set -e -o pipefail; safe_apply_batch_body "$arrname" )
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        result_fail "Ошибка применения (${category}) — откатываю."
+        safe_restore_backup "$category"
+        return 1
+    fi
+
+    if [[ "$category" == "ssh" ]]; then
+        local sshd_bin="" b
+        for b in /usr/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null || true)"; do
+            [[ -n "$b" && -x "$b" ]] && { sshd_bin="$b"; break; }
+        done
+        if [[ -n "$sshd_bin" ]] && ! "$sshd_bin" -t 2>/tmp/security_toolkit_sshd_test; then
+            result_fail "sshd -t не прошла проверку: $(cat /tmp/security_toolkit_sshd_test 2>/dev/null)"
+            rm -f /tmp/security_toolkit_sshd_test
+            safe_restore_backup "ssh"
+            return 1
+        fi
+        rm -f /tmp/security_toolkit_sshd_test
+        systemctl reload sshd 2>/dev/null || service sshd reload 2>/dev/null || true
+        result_pass "sshd -t пройдена, конфигурация перезагружена"
+    fi
+
+    safe_confirm_or_rollback "$category"
+}
+
+# Диспетчер: разводит найденные проблемы по трём сценариям —
+#  1) password/PAM — полноценный безопасный модуль apply_password_policy()
+#  2) ssh / firewall — safe_apply_batch() с бэкапом и окном отката
+#  3) всё остальное ("simple") — как раньше, разовое подтверждение на каждую правку
 offer_remediation() {
+    if (( PASS_POLICY_ISSUES == 0 && ${#FIXES_SSH[@]} == 0 && ${#FIXES_FW[@]} == 0 && ${#FIXES[@]} == 0 )); then
+        return
+    fi
+
+    if [[ $EUID -ne 0 ]]; then
+        echo ""
+        log "${YELLOW}${BOLD}⚠ Для применения исправлений требуется root.${RESET}"
+        log "  Запустите скрипт через: ${WHITE}sudo $0${RESET}"
+        return
+    fi
+
+    if (( PASS_POLICY_ISSUES > 0 )); then
+        echo ""
+        log "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════════════╗${RESET}"
+        log "${BOLD}${MAGENTA}║   ПАРОЛЬНАЯ/PAM-ПОЛИТИКА: найдено расхождений — ${PASS_POLICY_ISSUES}${RESET}"
+        log "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════════╝${RESET}"
+        log "  Точечные sed-фиксы для этого раздела не предлагаются — вместо них"
+        log "  запускается полноценный безопасный модуль (бэкап/валидация/откат)."
+        apply_password_policy
+    fi
+
+    safe_apply_batch "ssh" FIXES_SSH
+    safe_apply_batch "firewall" FIXES_FW
+
+    simple_remediation
+}
+
+# Старое поведение: показать команду, применить по одиночному подтверждению,
+# без бэкапа/отката. Используется для категорий, не относящихся к
+# password/ssh/firewall (ядро, ФС, логирование, cron, NTP, DNS, MAC, бэкдоры).
+simple_remediation() {
     [[ ${#FIXES[@]} -eq 0 ]] && return
 
     echo ""
@@ -1288,12 +2043,6 @@ offer_remediation() {
     log ""
     log "  Найдено ${#FIXES[@]} исправлений. Каждое требует вашего подтверждения."
     log ""
-
-    if [[ $EUID -ne 0 ]]; then
-        log "  ${YELLOW}${BOLD}⚠ Для применения исправлений требуется root.${RESET}"
-        log "  Запустите скрипт через: ${WHITE}sudo $0${RESET}"
-        return
-    fi
 
     local applied=0
     local skipped=0
@@ -1349,13 +2098,9 @@ offer_remediation() {
     fi
 }
 
-MENU_CHOICE=""
-
 # 17. NTP — синхронизация времени
 check_ntp() {
     section "NTP — СИНХРОНИЗАЦИЯ ВРЕМЕНИ"
-
-    local ntp_ok=0
 
     # ── Определяем активный NTP-демон ────────────────────────────────────────
     result_info "${BOLD}Статус NTP-сервиса:${RESET}"
@@ -1363,7 +2108,6 @@ check_ntp() {
     # systemd-timesyncd
     if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
         result_pass "systemd-timesyncd активен"
-        ntp_ok=1
         local tsd_status
         tsd_status=$(timedatectl show-timesync --value --property=ServerName 2>/dev/null || \
                      timedatectl timesync-status 2>/dev/null | head -5)
@@ -1385,7 +2129,7 @@ check_ntp() {
                 result_pass "Резервные NTP серверы: ${fallback}"
             else
                 result_warn "FallbackNTP= не задан — нет резервных серверов"
-                add_fix "Добавить резервные NTP серверы в timesyncd.conf" \
+                add_fix "Добавить резервные NTP серверы в timesyncd.conf" "simple" \
                     "grep -q '^FallbackNTP' /etc/systemd/timesyncd.conf && \
                      sed -i 's/^FallbackNTP.*/FallbackNTP=0.pool.ntp.org 1.pool.ntp.org/' /etc/systemd/timesyncd.conf || \
                      echo 'FallbackNTP=0.pool.ntp.org 1.pool.ntp.org' >> /etc/systemd/timesyncd.conf"
@@ -1395,7 +2139,6 @@ check_ntp() {
     elif systemctl is-active --quiet chrony 2>/dev/null || \
          systemctl is-active --quiet chronyd 2>/dev/null; then
         result_pass "chrony активен"
-        ntp_ok=1
         if command -v chronyc &>/dev/null; then
             local tracking
             tracking=$(chronyc tracking 2>/dev/null | grep -E "Reference ID|System time|Stratum")
@@ -1412,7 +2155,6 @@ check_ntp() {
     elif systemctl is-active --quiet ntp 2>/dev/null || \
          systemctl is-active --quiet ntpd 2>/dev/null; then
         result_pass "ntpd активен"
-        ntp_ok=1
         if command -v ntpq &>/dev/null; then
             result_info "${BOLD}  Пиры ntpq:${RESET}"
             ntpq -p 2>/dev/null | while read -r line; do
@@ -1422,7 +2164,7 @@ check_ntp() {
 
     else
         result_fail "Ни один NTP-демон не запущен (timesyncd / chrony / ntpd)"
-        add_fix "Включить systemd-timesyncd (синхронизация времени)" \
+        add_fix "Включить systemd-timesyncd (синхронизация времени)" "simple" \
             "systemctl enable --now systemd-timesyncd"
     fi
 
@@ -1444,7 +2186,7 @@ check_ntp() {
             result_pass "NTP включён (timedatectl NTP=yes)"
         else
             result_fail "NTP отключён в timedatectl"
-            add_fix "Включить NTP синхронизацию" "timedatectl set-ntp true"
+            add_fix "Включить NTP синхронизацию" "simple" "timedatectl set-ntp true"
         fi
 
         if [[ "${synced,,}" == "yes" || "${synced,,}" == "true" ]]; then
@@ -1490,7 +2232,7 @@ check_ntp() {
        systemctl is-active --quiet chronyd 2>/dev/null ); then
         local stratum
         stratum=$(chronyc tracking 2>/dev/null | grep "Stratum" | awk '{print $3}')
-        if [[ -n "$stratum" ]]; then
+        if is_num "$stratum"; then
             if (( stratum <= 3 )); then
                 result_pass "Stratum: ${stratum} (хорошо — близко к атомным часам)"
             elif (( stratum <= 5 )); then
@@ -1502,7 +2244,7 @@ check_ntp() {
     elif command -v timedatectl &>/dev/null; then
         local stratum
         stratum=$(timedatectl timesync-status 2>/dev/null | grep -i "Stratum" | awk '{print $2}')
-        if [[ -n "$stratum" ]]; then
+        if is_num "$stratum"; then
             if (( stratum <= 3 )); then
                 result_pass "Stratum: ${stratum}"
             else
@@ -1521,7 +2263,7 @@ check_ntp() {
             # Смотрим — слушает на 0.0.0.0 (опасно для публичных серверов) или только lo
             if echo "$ntp_listen" | grep -qE "0\.0\.0\.0:123|:::123|\*:123"; then
                 result_warn "NTP порт 123 открыт на всех интерфейсах (сервер может быть использован для amplification-атак)"
-                add_fix "Ограничить NTP только localhost если сервер не является NTP-сервером" \
+                add_fix "Ограничить NTP только localhost если сервер не является NTP-сервером" "simple" \
                     "echo 'Настройте bindaddress в /etc/chrony.conf или /etc/ntp.conf'"
             else
                 result_pass "NTP порт 123 слушает только на локальных интерфейсах"
@@ -1557,7 +2299,8 @@ check_ntp() {
 
         # Количество серверов
         local srv_count
-        srv_count=$(grep -cE "^\s*(server|pool|peer)" "$chrony_conf" 2>/dev/null || echo 0)
+        srv_count=$(grep -cE "^\s*(server|pool|peer)" "$chrony_conf" 2>/dev/null)
+        srv_count="${srv_count:-0}"
         if (( srv_count >= 3 )); then
             result_pass "Источников NTP: ${srv_count} (≥ 3 — хорошо для отказоустойчивости)"
         elif (( srv_count >= 1 )); then
@@ -1578,7 +2321,7 @@ check_dns() {
     local dns_servers=()
 
     # systemd-resolved
-    if command -v resolvectl &>/dev/null 2>/dev/null; then
+    if command -v resolvectl &>/dev/null; then
         result_info "  ${DIM}(через systemd-resolved / resolvectl)${RESET}"
         local res_dns
         res_dns=$(resolvectl status 2>/dev/null | grep "DNS Servers" | sed 's/.*DNS Servers: //' | head -3)
@@ -1632,7 +2375,7 @@ check_dns() {
     for ip in "${dns_servers[@]}"; do
         # Дедупликация
         local dup=0
-        for s in "${seen_servers[@]:-}"; do [[ "$s" == "$ip" ]] && dup=1 && break; done
+        for s in ${seen_servers[@]+"${seen_servers[@]}"}; do [[ "$s" == "$ip" ]] && dup=1 && break; done
         (( dup == 1 )) && continue
         seen_servers+=("$ip")
 
@@ -1655,6 +2398,8 @@ check_dns() {
     done
 
     (( has_public == 1 )) && result_warn "Используется публичный DNS — все DNS-запросы видны провайдеру сервиса"
+    (( has_public == 1 && has_internal == 1 )) && \
+        result_warn "Смешаны внутренний и публичный DNS — внутренние имена могут утекать наружу"
 
     # ── /etc/resolv.conf — безопасность ──────────────────────────────────────
     echo ""
@@ -1677,7 +2422,7 @@ check_dns() {
         o_write=$(stat -c "%A" /etc/resolv.conf 2>/dev/null | cut -c9)
         if [[ "$o_write" == "w" ]]; then
             result_fail "/etc/resolv.conf доступен для записи всем пользователям!"
-            add_fix "Убрать world-write с /etc/resolv.conf" \
+            add_fix "Убрать world-write с /etc/resolv.conf" "simple" \
                 "chmod o-w /etc/resolv.conf"
         fi
 
@@ -1733,7 +2478,7 @@ check_dns() {
                 result_pass "DNSSEC: ${dnssec} (проверка подписи DNS включена)"
             elif [[ "${dnssec,,}" == "no" || -z "$dnssec" ]]; then
                 result_warn "DNSSEC отключён — DNS-ответы не проверяются на подлинность"
-                add_fix "Включить DNSSEC в systemd-resolved" \
+                add_fix "Включить DNSSEC в systemd-resolved" "simple" \
                     "grep -q '^DNSSEC' /etc/systemd/resolved.conf && \
                      sed -i 's/^DNSSEC.*/DNSSEC=allow-downgrade/' /etc/systemd/resolved.conf || \
                      echo 'DNSSEC=allow-downgrade' >> /etc/systemd/resolved.conf; \
@@ -1747,7 +2492,7 @@ check_dns() {
                 result_pass "DNS-over-TLS: ${dot} (шифрование DNS запросов)"
             else
                 result_warn "DNS-over-TLS не включён — DNS запросы передаются в открытом виде"
-                add_fix "Включить DNS-over-TLS в systemd-resolved" \
+                add_fix "Включить DNS-over-TLS в systemd-resolved" "simple" \
                     "grep -q '^DNSOverTLS' /etc/systemd/resolved.conf && \
                      sed -i 's/^DNSOverTLS.*/DNSOverTLS=opportunistic/' /etc/systemd/resolved.conf || \
                      echo 'DNSOverTLS=opportunistic' >> /etc/systemd/resolved.conf; \
@@ -1857,13 +2602,13 @@ check_backdoors() {
     section "🔍 ПОИСК БЭКДОРОВ И ЗАКЛАДОК"
     log "  ${DIM}Глубокое сканирование — может занять несколько минут...${RESET}"
 
-    local bd_found=0
+    local bd_found=0 f
 
     # ── 1. Подозрительные SUID/SGID бинарники ────────────────────────────────
     result_info "${BOLD}SUID/SGID файлы вне стандартных путей:${RESET}"
     local suid_list
-    suid_list=$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null \
-        | grep -Ev "^(/usr/(bin|sbin|lib|libexec)|/bin|/sbin|/usr/local/(bin|sbin))" \
+    collect_suid
+    suid_list=$(grep -Ev "^(/usr/(bin|sbin|lib|libexec)|/bin|/sbin|/usr/local/(bin|sbin))" <<< "$SUID_CACHE" \
         | grep -Ev "^(/var/lib/(docker|containerd|podman|lxc|lxd)|/run/containerd|/snap)")
     if [[ -z "$suid_list" ]]; then
         result_pass "Нестандартных SUID/SGID не найдено"
@@ -1896,29 +2641,34 @@ check_backdoors() {
     # ── 3. Процессы без исполняемого файла на диске (deleted) ────────────────
     echo ""
     result_info "${BOLD}Процессы с удалённым исполняемым файлом (deleted):${RESET}"
-    local del_procs
-    del_procs=$(ls -la /proc/*/exe 2>/dev/null | grep "deleted" | awk '{print $NF}')
-    if [[ -z "$del_procs" ]]; then
+    # БЫЛО: `ls -la /proc/*/exe | awk '{print $NF}'` возвращало литерал
+    # "(deleted)", а не путь, поэтому PID никогда не извлекался и вся проверка
+    # печатала мусор. Читаем симлинки напрямую.
+    local del_count=0 proc_exe pid target cmd
+    for proc_exe in /proc/[0-9]*/exe; do
+        target=$(readlink "$proc_exe" 2>/dev/null) || continue
+        [[ "$target" == *"(deleted)"* ]] || continue
+        pid="${proc_exe#/proc/}"; pid="${pid%/exe}"
+        cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | head -c 80)
+        result_fail "Процесс PID=${pid} из удалённого файла '${target% (deleted)}': ${cmd:-<нет cmdline>}"
+        del_count=$((del_count+1))
+    done
+    if (( del_count == 0 )); then
         result_pass "Процессов с удалённым exe не обнаружено"
     else
-        while read -r p; do
-            local pid
-            pid=$(echo "$p" | grep -oP '/proc/\K[0-9]+')
-            local cmd
-            cmd=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr ' ' ' ' | head -c 80)
-            result_fail "Процесс PID=$pid запущен из удалённого файла: $cmd"
-            bd_found=$((bd_found+1))
-        done <<< "$del_procs"
+        bd_found=$((bd_found+del_count))
+        [[ $EUID -ne 0 ]] && result_info "  ${DIM}(без root видны только свои процессы)${RESET}"
     fi
 
     # ── 4. Нестандартные cron-задачи ─────────────────────────────────────────
     echo ""
     result_info "${BOLD}Нестандартные и пользовательские cron-задачи:${RESET}"
-    local cron_found=0
+    # БЫЛО: `find | while` — счётчик bd_found инкрементился в подоболочке и терялся
+    local crondir owner
     for crondir in /etc/cron.d /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/cron.hourly; do
         [[ -d "$crondir" ]] || continue
-        find "$crondir" -type f 2>/dev/null | while read -r f; do
-            local owner
+        while read -r f; do
+            [[ -n "$f" ]] || continue
             owner=$(stat -c "%U" "$f" 2>/dev/null)
             if [[ "$owner" != "root" ]]; then
                 result_fail "Cron-файл не от root: $f (владелец: $owner)"
@@ -1926,8 +2676,7 @@ check_backdoors() {
             else
                 result_info "  $f ${DIM}(root)${RESET}"
             fi
-        done
-        cron_found=$((cron_found+1))
+        done < <(find "$crondir" -type f 2>/dev/null)
     done
     # Пользовательские crontab
     if [[ -d /var/spool/cron/crontabs ]]; then
@@ -1945,20 +2694,24 @@ check_backdoors() {
     # ── 5. Systemd юниты не из стандартных путей ─────────────────────────────
     echo ""
     result_info "${BOLD}Нестандартные systemd-юниты:${RESET}"
-    local unit_hits=0
-    find /etc/systemd /run/systemd /usr/local/lib/systemd -name "*.service" -type f 2>/dev/null | while read -r u; do
-        # Смотрим ExecStart на подозрительные пути
-        local exec_start
-        exec_start=$(grep -E "^\s*ExecStart" "$u" 2>/dev/null | head -1)
-        if echo "$exec_start" | grep -qE "/tmp/|/dev/shm/|/var/tmp/|base64|eval|curl.*sh|wget.*sh|nc|ncat"; then
+    local unit_hits=0 unit_sus=0 u exec_start
+    while read -r u; do
+        [[ -n "$u" ]] || continue
+        unit_hits=$((unit_hits+1))
+        exec_start=$(grep -E "^[[:space:]]*ExecStart" "$u" 2>/dev/null | head -1)
+        if grep -qE "/tmp/|/dev/shm/|/var/tmp/|base64|eval|curl.*sh|wget.*sh|\bnc\b|\bncat\b" <<< "$exec_start"; then
             result_fail "Подозрительный ExecStart в юните $u: $exec_start"
+            unit_sus=$((unit_sus+1))
             bd_found=$((bd_found+1))
         else
-            result_info "  $(basename $u): $exec_start"
+            log_only "    $(basename "$u"): ${exec_start}"
         fi
-        unit_hits=$((unit_hits+1))
-    done
-    (( unit_hits == 0 )) && result_pass "Нестандартных systemd-юнитов не найдено"
+    done < <(find /etc/systemd /run/systemd /usr/local/lib/systemd -name "*.service" -type f 2>/dev/null)
+    if (( unit_hits == 0 )); then
+        result_pass "Локальных systemd-юнитов не найдено"
+    elif (( unit_sus == 0 )); then
+        result_pass "Проверено юнитов: ${unit_hits}, подозрительных ExecStart нет ${DIM}(список — в отчёте)${RESET}"
+    fi
 
     # ── 6. Подозрительные ~/.ssh/authorized_keys ─────────────────────────────
     echo ""
@@ -1969,7 +2722,8 @@ check_backdoors() {
         local akfile="${home}/.ssh/authorized_keys"
         [[ -f "$akfile" ]] || continue
         local key_count
-        key_count=$(grep -cv "^#\|^$" "$akfile" 2>/dev/null || echo 0)
+        key_count=$(grep -cv "^#\|^$" "$akfile" 2>/dev/null)
+        key_count="${key_count:-0}"
         result_info "  ${uname}: ${akfile} — ${key_count} ключей"
         # Команды в ключах (command= опция) — потенциальный бэкдор
         if grep -qE "^command=" "$akfile" 2>/dev/null; then
@@ -1991,17 +2745,21 @@ check_backdoors() {
     echo ""
     result_info "${BOLD}Нестандартные LISTEN-порты (>1024, кроме типичных):${RESET}"
     local common_ports="3000|3306|5432|5672|6379|8080|8443|8888|9200|9300|27017|27018"
+    local nonstd=0 line port proc
     if command -v ss &>/dev/null; then
-        ss -tlnp 2>/dev/null | grep LISTEN | while read -r line; do
-            local port
-            port=$(echo "$line" | awk '{print $4}' | rev | cut -d: -f1 | rev)
-            local proc
-            proc=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "?")
-            if [[ "$port" =~ ^[0-9]+$ ]] && (( port > 1024 )) && ! echo "$port" | grep -qE "^(${common_ports})$"; then
-                result_warn "Нестандартный порт $port — процесс: $proc"
+        while read -r line; do
+            [[ -n "$line" ]] || continue
+            port=$(awk '{print $4}' <<< "$line" | rev | cut -d: -f1 | rev)
+            proc=$(grep -oP 'users:\(\("\K[^"]+' <<< "$line" || echo "?")
+            if is_num "$port" && (( port > 1024 )) && ! grep -qE "^(${common_ports})$" <<< "$port"; then
+                result_warn "Нестандартный порт $port — процесс: ${proc:-?}"
+                nonstd=$((nonstd+1))
                 bd_found=$((bd_found+1))
             fi
-        done
+        done < <(ss -tlnp 2>/dev/null | grep LISTEN)
+        (( nonstd == 0 )) && result_pass "Нестандартных LISTEN-портов не обнаружено"
+    else
+        result_info "ss недоступен — проверка портов пропущена"
     fi
 
     # ── 8. Netcat, socat, nmap, masscan — инструменты в системе ──────────────
@@ -2038,7 +2796,7 @@ check_backdoors() {
     # ── 10. Файлы .bash_history с подозрительными командами ──────────────────
     echo ""
     result_info "${BOLD}Анализ bash_history (подозрительные команды):${RESET}"
-    local sus_patterns="base64 -d|curl.*sh|wget.*sh|chmod.*777|/dev/tcp/|nc -e|ncat -e|python.*-c.*import|perl.*-e|/dev/shm|mkfifo"
+    local sus_patterns="base64 -d|curl.*sh|wget.*sh|\bchmod.*777\b|/dev/tcp/|\bnc -e\b|\bncat -e\b|python.*-c.*import|perl.*-e|/dev/shm|mkfifo"
     local history_found=0
     while IFS=: read -r uname _ uid _ _ home _; do
         (( uid < 1000 )) && [[ "$uname" != "root" ]] && continue
@@ -2086,7 +2844,7 @@ check_backdoors() {
     [[ ${#pam_dirs[@]} -eq 0 ]] && pam_dirs=("/usr/lib/x86_64-linux-gnu/security" "/lib/x86_64-linux-gnu/security")
     # Проверяем что dpkg реально знает файлы системы (в контейнерах база может быть пустой)
     local dpkg_functional=0
-    if command -v dpkg &>/dev/null 2>/dev/null; then
+    if command -v dpkg &>/dev/null; then
         # Проверяем что база dpkg не пустая - /usr/bin/env должен быть в coreutils
         if dpkg -S /usr/bin/env &>/dev/null 2>&1; then
             dpkg_functional=1
@@ -2107,7 +2865,7 @@ check_backdoors() {
             # Проверяем принадлежность пакету только если dpkg реально работает
             if (( dpkg_functional == 1 )); then
                 dpkg -S "$mod" &>/dev/null 2>&1 && pkg_known=1
-            elif command -v rpm &>/dev/null 2>/dev/null; then
+            elif command -v rpm &>/dev/null; then
                 rpm -qf "$mod" &>/dev/null 2>&1 && pkg_known=1
             else
                 pkg_known=1  # Нет пакетного менеджера — не можем проверить, пропускаем
@@ -2126,19 +2884,10 @@ check_backdoors() {
                     result_fail "PAM-модуль доступен для записи group/other (${mod_perm}): $mod"
                     pam_sus_found=$((pam_sus_found+1))
                 elif (( pkg_known == 0 )); then
-                    # Если пакетный менеджер доступен, но модуль не найден — подозрительно
-                    if command -v dpkg &>/dev/null 2>/dev/null; then
-                        if ! dpkg -S "$mod" &>/dev/null 2>&1; then
-                            result_warn "PAM-модуль не найден в базе пакетов: $(basename $mod)"
-                            pam_sus_found=$((pam_sus_found+1))
-                        fi
-                    elif command -v rpm &>/dev/null 2>/dev/null; then
-                        if ! rpm -qf "$mod" &>/dev/null 2>&1; then
-                            result_warn "PAM-модуль не найден в базе пакетов: $(basename $mod)"
-                            pam_sus_found=$((pam_sus_found+1))
-                        fi
-                    fi
-                    # Если dpkg/rpm недоступен — файл от root с нормальными правами, молчим
+                    # pkg_known уже вычислен выше через dpkg/rpm — повторно
+                    # дёргать пакетный менеджер незачем
+                    result_warn "PAM-модуль не найден в базе пакетов: $(basename "$mod")"
+                    pam_sus_found=$((pam_sus_found+1))
                 fi
             fi
         done < <(find "$pdir" -name "*.so" -type f 2>/dev/null)
@@ -2193,7 +2942,7 @@ check_backdoors() {
         fi
     else
         result_warn "chkrootkit и rkhunter не установлены"
-        add_fix "Установить rkhunter для проверки руткитов"             "apt-get install -y rkhunter 2>/dev/null || yum install -y rkhunter 2>/dev/null; echo 'rkhunter установлен'"
+        add_fix "Установить rkhunter для проверки руткитов" "simple" "apt-get install -y rkhunter 2>/dev/null || yum install -y rkhunter 2>/dev/null; echo 'rkhunter установлен'"
     fi
 
     # ── Итог ─────────────────────────────────────────────────────────────────
@@ -2223,9 +2972,9 @@ show_menu() {
     echo -e "  ${WHITE}${BOLD}5)${RESET} Сеть и брандмауэр" >/dev/tty
     echo -e "  ${WHITE}${BOLD}6)${RESET} Ядро, файловая система, шифрование" >/dev/tty
     echo -e "  ${WHITE}${BOLD}7)${RESET} Логирование, SELinux/AppArmor" >/dev/tty
+    echo -e "  ${WHITE}${BOLD}8)${RESET}  ${RED}Поиск бэкдоров и закладок${RESET} ${DIM}(отдельный модуль, долго)${RESET}" >/dev/tty
     echo -e "  ${WHITE}${BOLD}9)${RESET}  NTP — синхронизация времени" >/dev/tty
     echo -e "  ${WHITE}${BOLD}10)${RESET} DNS — конфигурация и безопасность" >/dev/tty
-    echo -e "  ${RED}${BOLD}8)${RESET}${RED} Поиск бэкдоров и закладок ${DIM}(отдельный модуль)${RESET}" >/dev/tty
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────${RESET}" >/dev/tty
     echo -e "  ${CYAN}${BOLD}s)${RESET} Настройки параметров аудита" >/dev/tty
     echo -e "  ${WHITE}${BOLD}q)${RESET} Выход" >/dev/tty
@@ -2245,6 +2994,10 @@ run_checks() {
     local mode="${1:-1}"
     # Сбрасываем накопленные исправления перед новым прогоном
     FIXES=()
+    FIXES_SSH=()
+    FIXES_FW=()
+    PASS_POLICY_ISSUES=0
+    NOPASS_USERS=()
     case "$mode" in
         1)
             check_password_policy; check_pam_pwquality
@@ -2259,6 +3012,7 @@ run_checks() {
             check_ntp; check_dns
             ;;
         2) check_password_policy; check_pam_pwquality ;;
+        0) : ;;   # ничего не запускать
         3) check_ssh; check_ssh_crypto ;;
         4) check_accounts ;;
         5) check_network; check_firewall ;;
@@ -2275,10 +3029,12 @@ run_checks() {
 main() {
     local skip_interactive=0
     local oneshot_mode=""
+    local report_only=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --full|-f)        oneshot_mode="1"; skip_interactive=1 ;;
+            --password|--pam) oneshot_mode="2"; skip_interactive=1 ;;
             --ssh)            oneshot_mode="3"; skip_interactive=1 ;;
             --accounts)       oneshot_mode="4"; skip_interactive=1 ;;
             --network)        oneshot_mode="5"; skip_interactive=1 ;;
@@ -2288,9 +3044,19 @@ main() {
             --ntp)            oneshot_mode="9"; skip_interactive=1 ;;
             --dns)            oneshot_mode="10"; skip_interactive=1 ;;
             --no-interactive) skip_interactive=1 ;;
+            --report-only)    report_only=1 ;;
+            --timeout)
+                shift
+                # БЫЛО: shift без проверки — `--timeout` последним аргументом
+                # падал на unbound variable из-за set -u
+                [[ $# -gt 0 ]] || { echo "Ошибка: --timeout требует значение"; exit 2; }
+                CONFIRM_TIMEOUT="$1"
+                ;;
+            --no-rollback-guard) DO_ROLLBACK_GUARD=0 ;;
             --help|-h)
                 echo "Использование: $0 [ОПЦИЯ]"
                 echo "  --full           Полный аудит"
+                echo "  --password       Только парольная политика и PAM"
                 echo "  --ssh            Только SSH"
                 echo "  --accounts       Только учётные записи"
                 echo "  --network        Только сеть"
@@ -2299,7 +3065,10 @@ main() {
                 echo "  --backdoors      Поиск бэкдоров"
                 echo "  --ntp            Проверка NTP"
                 echo "  --dns            Проверка DNS"
-                echo "  --no-interactive Без интерактива"
+                echo "  --no-interactive Без интерактива (пороги по умолчанию)"
+                echo "  --report-only    Только отчёт, без предложения исправлений"
+                echo "  --timeout N      Секунд на подтверждение перед авто-откатом (безопасное применение)"
+                echo "  --no-rollback-guard  Отключить авто-откат по таймауту (не рекомендуется на проде)"
                 echo "  --help           Справка"
                 exit 0
                 ;;
@@ -2308,8 +3077,15 @@ main() {
         shift
     done
 
-    check_root
+    if [[ ! "$CONFIRM_TIMEOUT" =~ ^[0-9]+$ ]] || (( CONFIRM_TIMEOUT < 10 )); then
+        echo "Некорректный --timeout: '${CONFIRM_TIMEOUT}' (нужно целое >= 10)"
+        exit 2
+    fi
+
+    # print_banner делает clear — предупреждение о запуске без root должно
+    # выводиться ПОСЛЕ него, иначе пользователь его никогда не видел.
     print_banner
+    check_root
 
     if [[ "$skip_interactive" -eq 0 ]]; then
         interactive_setup
@@ -2319,7 +3095,7 @@ main() {
     if [[ -n "$oneshot_mode" ]]; then
         run_checks "$oneshot_mode"
         print_summary
-        offer_remediation
+        [[ "$report_only" -eq 0 ]] && offer_remediation
         echo ""
         echo -e "${DIM}Отчёт сохранён: ${WHITE}${REPORT_FILE}${RESET}"
         echo ""
@@ -2346,7 +3122,7 @@ main() {
             *)
                 run_checks "$MENU_CHOICE"
                 print_summary
-                offer_remediation
+                (( report_only == 0 )) && offer_remediation
                 echo ""
                 echo -e "${DIM}Отчёт дополнен: ${WHITE}${REPORT_FILE}${RESET}"
                 echo ""
