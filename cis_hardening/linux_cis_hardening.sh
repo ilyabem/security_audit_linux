@@ -3594,6 +3594,7 @@ users_with_keys() {
 }
 
 BANNER_TEXT="Authorized users only. All activity may be monitored and reported."
+WIZARD_DONE=0
 
 interactive_setup() {
     ANS=()
@@ -3725,19 +3726,38 @@ interactive_setup() {
     if confirm "Включить предохранитель (авто-откат по таймауту)" y; then DO_ROLLBACK_GUARD=1; else DO_ROLLBACK_GUARD=0; fi
 
     echo ""
+    WIZARD_DONE=1
     echo -e "${GREEN}${BOLD}✔ Параметры сохранены. О найденных сервисах и портах спрошу по ходу проверки.${RESET}"
     sleep 1
 }
 
 # Дефолты для --no-interactive: безопасные («ничего не отрезать»)
+# Роль сервера по косвенным признакам: Docker/K8s или включённый ip_forward → маршрутизирует
+D_ROUTER=n
+D_IPV6=n
+detect_role_defaults() {
+    D_ROUTER=n; D_IPV6=n
+    { command -v docker &>/dev/null || command -v kubelet &>/dev/null || [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; } && D_ROUTER=y
+    ip -6 addr show scope global 2>/dev/null | grep -q inet6 && D_IPV6=y
+    return 0
+}
+
 noninteractive_defaults() {
-    local d_router=n d_ipv6=n
-    { command -v docker &>/dev/null || command -v kubelet &>/dev/null || [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; } && d_router=y
-    ip -6 addr show scope global 2>/dev/null | grep -q inet6 && d_ipv6=y
-    : "${ANS[role.router]:=$d_router}" "${ANS[role.ipv6]:=$d_ipv6}" "${ANS[role.usb]:=n}" "${ANS[role.gui]:=n}"
+    detect_role_defaults
+    : "${ANS[role.router]:=$D_ROUTER}" "${ANS[role.ipv6]:=$D_IPV6}" "${ANS[role.usb]:=n}" "${ANS[role.gui]:=n}"
     : "${ANS[ssh.root_login]:=prohibit-password}" "${ANS[ssh.no_password]:=n}" "${ANS[ssh.forwarding]:=y}" "${ANS[ssh.gssapi]:=y}"
     : "${ANS[net.slaac]:=y}"
     [[ -n "${ANS[banner.text]:-}" ]] && BANNER_TEXT="${ANS[banner.text]}"
+    return 0
+}
+
+# Ответы для аудита «как есть»: строгая трактовка CIS — то, о чём опросник
+# не спрашивал, считается ненужным. Ответы пройденного опросника важнее.
+audit_defaults() {
+    detect_role_defaults
+    : "${ANS[role.router]:=$D_ROUTER}" "${ANS[role.ipv6]:=$D_IPV6}" "${ANS[role.usb]:=n}" "${ANS[role.gui]:=n}"
+    : "${ANS[ssh.root_login]:=no}" "${ANS[ssh.no_password]:=n}" "${ANS[ssh.forwarding]:=n}" "${ANS[ssh.gssapi]:=n}"
+    : "${ANS[net.slaac]:=y}"
     return 0
 }
 
@@ -3847,6 +3867,8 @@ show_menu() {
     echo -e "${BOLD}${MAGENTA}║        Выберите раздел CIS (профиль: Level ${CIS_LEVEL})               ║${RESET}" >/dev/tty
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════╝${RESET}" >/dev/tty
     echo "" >/dev/tty
+    echo -e "  ${GREEN}${BOLD}0)${RESET}  Аудит текущих настроек ${DIM}(только посмотреть: без вопросов, ничего не меняет)${RESET}" >/dev/tty
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${RESET}" >/dev/tty
     echo -e "  ${WHITE}${BOLD}1)${RESET}  Полный харденинг (все разделы)" >/dev/tty
     echo -e "  ${WHITE}${BOLD}2)${RESET}  1.1   Файловые системы, модули ядра, /tmp" >/dev/tty
     echo -e "  ${WHITE}${BOLD}3)${RESET}  1.2–1.5 Обновления, загрузчик, защита процессов" >/dev/tty
@@ -3869,8 +3891,8 @@ show_menu() {
         read -r MENU_CHOICE </dev/tty || MENU_CHOICE="q"
         MENU_CHOICE="${MENU_CHOICE//[[:space:]]/}"
         case "$MENU_CHOICE" in
-            1|2|3|4|5|6|7|8|9|10|11|r|R|p|P|s|S|q|Q) break ;;
-            *) echo -e "${RED}  Введите цифру 1–11, r, p, s или q${RESET}" >/dev/tty ;;
+            0|1|2|3|4|5|6|7|8|9|10|11|r|R|p|P|s|S|q|Q) break ;;
+            *) echo -e "${RED}  Введите цифру 0–11, r, p, s или q${RESET}" >/dev/tty ;;
         esac
     done
 }
@@ -3921,9 +3943,44 @@ run_cycle() {
     fi
 }
 
+# Аудит текущих настроек: все разделы, без вопросов и без исправлений.
+# Ответы опросника и режимы после аудита возвращаются как были.
+run_audit() {
+    local saved_ni="$NONINTERACTIVE" saved_ro="$REPORT_ONLY" k
+    local -A saved_ans=()
+    if (( ${#ANS[@]} )); then for k in "${!ANS[@]}"; do saved_ans[$k]="${ANS[$k]}"; done; fi
+    NONINTERACTIVE=1; REPORT_ONLY=1
+    audit_defaults
+    log ""
+    log "${BOLD}${CYAN}══════════ АУДИТ ТЕКУЩИХ НАСТРОЕК (ничего не меняется) ══════════${RESET}"
+    if (( WIZARD_DONE == 0 )); then
+        log "  ${DIM}Опросник не пройден: пороги — рекомендации CIS Level ${CIS_LEVEL}, сервисы и порты оцениваются по строгому CIS.${RESET}"
+    fi
+    run_cycle 1
+    log ""
+    log "  ${DIM}Чтобы исправить найденное, выберите раздел 1–11 (перед первым применением будет опросник).${RESET}"
+    ANS=()
+    if (( ${#saved_ans[@]} )); then for k in "${!saved_ans[@]}"; do ANS[$k]="${saved_ans[$k]}"; done; fi
+    NONINTERACTIVE="$saved_ni"; REPORT_ONLY="$saved_ro"
+}
+
+# Явные флаги командной строки важнее значений из профиля и опросника.
+# Читает локальные переменные main (динамическая область видимости bash).
+apply_cli_overrides() {
+    [[ -n "$level_override" ]] && CIS_LEVEL="$level_override"
+    [[ -n "$timeout_override" ]] && CONFIRM_TIMEOUT="$timeout_override"
+    [[ -n "$noguard_override" ]] && DO_ROLLBACK_GUARD=0
+    return 0
+}
+
 usage() {
     cat <<EOF
 Использование: $0 [ОПЦИИ]
+
+Без опций — меню; пункт 0 в нём — аудит без вопросов.
+
+Аудит:
+  --audit           Аудит текущих настроек по CIS: без вопросов, ничего не меняет
 
 Разделы (one-shot, без меню):
   --full, -f        Все разделы CIS
@@ -3955,10 +4012,11 @@ EOF
 main() {
     local skip_interactive=0
     local oneshot_mode=""
-    local profile_in="" profile_out="" level_override="" timeout_override="" noguard_override=""
+    local profile_in="" profile_out="" level_override="" timeout_override="" noguard_override="" audit_only=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --audit)          audit_only=1 ;;
             --full|-f)        oneshot_mode="1" ;;
             --fs)             oneshot_mode="2" ;;
             --boot)           oneshot_mode="3" ;;
@@ -4022,21 +4080,27 @@ main() {
         fi
         noninteractive_defaults
     fi
-    # Явные флаги командной строки важнее значений из профиля
-    [[ -n "$level_override" ]] && CIS_LEVEL="$level_override"
-    [[ -n "$timeout_override" ]] && CONFIRM_TIMEOUT="$timeout_override"
-    [[ -n "$noguard_override" ]] && DO_ROLLBACK_GUARD=0
+    (( skip_interactive )) && WIZARD_DONE=1
+    apply_cli_overrides
 
     # print_banner делает clear — предупреждение о запуске без root должно
     # выводиться ПОСЛЕ него, иначе пользователь его никогда не видел бы.
     print_banner
     check_root
 
-    if [[ "$skip_interactive" -eq 0 ]]; then
+    if (( audit_only )); then
+        run_audit
+        echo ""
+        echo -e "${DIM}Отчёт сохранён: ${WHITE}${REPORT_FILE}${RESET}"
+        echo ""
+        exit 0
+    fi
+
+    # Опросник нужен перед применением. Для one-shot и --save-profile — сразу;
+    # в меню — перед первым разделом 1–11, чтобы пункт 0 (аудит) открывался мгновенно.
+    if (( WIZARD_DONE == 0 )) && [[ -n "$oneshot_mode" || -n "$profile_out" ]]; then
         interactive_setup
-        [[ -n "$level_override" ]] && CIS_LEVEL="$level_override"
-        [[ -n "$timeout_override" ]] && CONFIRM_TIMEOUT="$timeout_override"
-        [[ -n "$noguard_override" ]] && DO_ROLLBACK_GUARD=0
+        apply_cli_overrides
     fi
     [[ -n "$profile_out" ]] && save_profile "$profile_out"
 
@@ -4053,12 +4117,20 @@ main() {
         exit 0
     fi
 
-    # ── Интерактивный цикл меню (опросник проходится ОДИН РАЗ) ───────────────
+    # ── Интерактивный цикл меню (опросник — один раз, перед первым применением) ──
     while true; do
         show_menu
 
         case "$MENU_CHOICE" in
-            s|S) interactive_setup; continue ;;
+            s|S) interactive_setup; apply_cli_overrides; continue ;;
+            0)
+                run_audit
+                echo ""
+                echo -e "${DIM}Отчёт дополнен: ${WHITE}${REPORT_FILE}${RESET}"
+                echo ""
+                echo -e "${DIM}Нажмите Enter для возврата в меню...${RESET}"
+                read -r </dev/tty || true
+                ;;
             p|P)
                 ask_str _profile_path "Куда сохранить профиль" "/root/cis-hardening-profile.conf" '^/[^ ]+$'
                 save_profile "$STR_RESULT"; unset 'ANS[_profile_path]'
@@ -4072,6 +4144,10 @@ main() {
                 exit 0
                 ;;
             *)
+                if (( WIZARD_DONE == 0 )); then
+                    interactive_setup
+                    apply_cli_overrides
+                fi
                 run_cycle "$MENU_CHOICE"
                 echo ""
                 echo -e "${DIM}Отчёт дополнен: ${WHITE}${REPORT_FILE}${RESET}"
